@@ -1,0 +1,64 @@
+{
+  "starting_cash": 200.0,
+  "cash": 38.84,
+  "equity": {
+    "GDX": {
+      "symbol": "GDX",
+      "quantity": 2.0,
+      "avg_cost": 80.58
+    }
+  },
+  "options": {},
+  "orders": [
+    {
+      "timestamp_unix": 1781286271,
+      "asset_type": "equity",
+      "symbol": "GDX",
+      "side": "buy",
+      "quantity": 2.0,
+      "fill_price": 80.58,
+      "total_value": 161.16,
+      "expiration": null,
+      "strike": null,
+      "option_type": null
+    }
+  ],
+  "price_cache": {
+    "PWRL": 19.6,
+    "XLV": 154.06,
+    "STTK": 4.84,
+    "OMER": 8.77,
+    "SENEA": 169.1,
+    "GDX": 80.58,
+    "XLY": 116.26,
+    "XLF": 53.21,
+    "XLI": 176.33,
+    "XLE": 57.71,
+    "XLU": 44.39,
+    "SIL": 82.31,
+    "FLY": 32.59,
+    "IWM": 294.12,
+    "XLK": 185.55,
+    "TLT": 85.74,
+    "XLRE": 45.29,
+    "QQQ": 723.13,
+    "VELO": 24.87,
+    "ALIT": 0.7755,
+    "UNG": 11.3,
+    "SIDU": 3.74,
+    "AXTI": 102.14,
+    "DXYZ": 29.71,
+    "SLV": 61.56,
+    "USO": 126.21,
+    "GLD": 387.66,
+    "XLP": 85.55,
+    "GDXJ": 105.1,
+    "ELVN": 46.57,
+    "XLB": 52.27,
+    "SPY": 742.01,
+    "SPCE": 4.14,
+    "XLC": 112.07,
+    "BOT": 37.19
+  },
+  "real_synced": true
+}
