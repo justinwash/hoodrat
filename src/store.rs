@@ -1,11 +1,14 @@
+use crate::ingestion::{BrokerDataSink, ExecutionRecord, PortfolioSnapshot};
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use serde_json::Value;
 use std::path::Path;
 
-const MIGRATION: &str = include_str!("../migrations/001_initial.sql");
+const INITIAL_MIGRATION: &str = include_str!("../migrations/001_initial.sql");
+const TOOL_EVENTS_MIGRATION: &str = include_str!("../migrations/002_tool_events.sql");
+const SCHEMA_METADATA_MIGRATION: &str = include_str!("../migrations/003_schema_metadata.sql");
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RunRecord {
@@ -30,12 +33,26 @@ pub struct AgentEventRecord {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct AgentToolEventRecord {
+    pub run_id: String,
+    pub sequence_number: u32,
+    pub tool_name: String,
+    pub input_json: Option<String>,
+    pub output_json: Option<String>,
+    pub is_error: bool,
+    pub recorded_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct DashboardSnapshot {
     pub bot_status: String,
     pub last_run: String,
     pub last_run_status: String,
     pub recent_events: String,
     pub database_path: String,
+    pub portfolio_value: Option<f64>,
+    pub buying_power: Option<f64>,
+    pub realized_pnl: Option<f64>,
 }
 
 pub struct Store {
@@ -52,7 +69,9 @@ impl Store {
         let connection = Connection::open(path)
             .with_context(|| format!("failed to open database at {}", path.display()))?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
-        connection.execute_batch(MIGRATION)?;
+        connection.execute_batch(INITIAL_MIGRATION)?;
+        connection.execute_batch(TOOL_EVENTS_MIGRATION)?;
+        connection.execute_batch(SCHEMA_METADATA_MIGRATION)?;
         Ok(Self { connection })
     }
 
@@ -80,13 +99,29 @@ impl Store {
 
     pub fn record_agent_event(&self, event: &AgentEventRecord) -> Result<()> {
         self.connection.execute(
-            "INSERT INTO agent_events (run_id, sequence_number, event_type, text, raw_json, recorded_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT OR REPLACE INTO agent_events (run_id, sequence_number, event_type, text, raw_json, recorded_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 event.run_id,
                 event.sequence_number,
                 event.event_type,
                 event.text,
                 event.raw_json,
+                event.recorded_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn record_tool_event(&self, event: &AgentToolEventRecord) -> Result<()> {
+        self.connection.execute(
+            "INSERT OR REPLACE INTO agent_tool_events (run_id, sequence_number, tool_name, input_json, output_json, is_error, recorded_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                event.run_id,
+                event.sequence_number,
+                event.tool_name,
+                event.input_json,
+                event.output_json,
+                event.is_error,
                 event.recorded_at,
             ],
         )?;
@@ -109,16 +144,20 @@ impl Store {
 
     #[allow(dead_code)]
     pub fn record_portfolio_snapshot(&self, raw: &Value) -> Result<()> {
-        let object = raw.as_object();
+        let snapshot = PortfolioSnapshot::from_value(raw)?;
+        self.ingest_portfolio_snapshot(&snapshot)
+    }
+
+    fn insert_portfolio_snapshot(&self, snapshot: &PortfolioSnapshot) -> Result<()> {
         self.connection.execute(
             "INSERT INTO portfolio_snapshots (captured_at, total_value_usd, buying_power_usd, realized_pnl_usd, unrealized_pnl_usd, raw_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
-                now(),
-                object.and_then(|o| number(o, "total_value_usd")),
-                object.and_then(|o| number(o, "buying_power_usd")),
-                object.and_then(|o| number(o, "realized_pnl_usd")),
-                object.and_then(|o| number(o, "unrealized_pnl_usd")),
-                serde_json::to_string(raw)?,
+                snapshot.captured_at,
+                snapshot.total_value_usd,
+                snapshot.buying_power_usd,
+                snapshot.realized_pnl_usd,
+                snapshot.unrealized_pnl_usd,
+                serde_json::to_string(&snapshot.raw)?,
             ],
         )?;
         Ok(())
@@ -126,25 +165,26 @@ impl Store {
 
     #[allow(dead_code)]
     pub fn record_execution(&self, raw: &Value, run_id: Option<&str>) -> Result<()> {
-        let object = raw
-            .as_object()
-            .context("execution payload must be a JSON object")?;
-        let external_id = object.get("external_id").and_then(Value::as_str);
+        let execution = ExecutionRecord::from_value(raw)?;
+        self.ingest_execution(&execution, run_id)
+    }
+
+    fn insert_execution(&self, execution: &ExecutionRecord, run_id: Option<&str>) -> Result<()> {
         self.connection.execute(
             "INSERT OR REPLACE INTO executions (external_id, run_id, asset_class, symbol, side, quantity, notional_usd, status, submitted_at, filled_at, average_fill_price, raw_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
-                external_id,
+                execution.external_id,
                 run_id,
-                object.get("asset_class").and_then(Value::as_str).unwrap_or("unknown"),
-                object.get("symbol").and_then(Value::as_str).unwrap_or("unknown"),
-                object.get("side").and_then(Value::as_str).unwrap_or("unknown"),
-                object.get("quantity").and_then(Value::as_f64),
-                object.get("notional_usd").and_then(Value::as_f64),
-                object.get("status").and_then(Value::as_str).unwrap_or("unknown"),
-                object.get("submitted_at").and_then(Value::as_str),
-                object.get("filled_at").and_then(Value::as_str),
-                object.get("average_fill_price").and_then(Value::as_f64),
-                serde_json::to_string(raw)?,
+                execution.asset_class,
+                execution.symbol,
+                execution.side,
+                execution.quantity,
+                execution.notional_usd,
+                execution.status,
+                execution.submitted_at,
+                execution.filled_at,
+                execution.average_fill_price,
+                serde_json::to_string(&execution.raw)?,
             ],
         )?;
         Ok(())
@@ -190,9 +230,60 @@ impl Store {
             .map_err(Into::into)
     }
 
+    #[allow(dead_code)]
+    pub fn tool_event_count(&self, run_id: &str) -> Result<u32> {
+        self.connection
+            .query_row(
+                "SELECT COUNT(*) FROM agent_tool_events WHERE run_id = ?1",
+                params![run_id],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
+    #[allow(dead_code)]
+    pub fn portfolio_snapshot_count(&self) -> Result<u32> {
+        self.connection
+            .query_row("SELECT COUNT(*) FROM portfolio_snapshots", [], |row| {
+                row.get(0)
+            })
+            .map_err(Into::into)
+    }
+
+    #[allow(dead_code)]
+    pub fn execution_count(&self) -> Result<u32> {
+        self.connection
+            .query_row("SELECT COUNT(*) FROM executions", [], |row| row.get(0))
+            .map_err(Into::into)
+    }
+
+    #[allow(dead_code)]
+    pub fn tool_event_error_count(&self, run_id: &str) -> Result<u32> {
+        self.connection
+            .query_row(
+                "SELECT COUNT(*) FROM agent_tool_events WHERE run_id = ?1 AND is_error = 1",
+                params![run_id],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
+    pub fn schema_version(&self) -> Result<u32> {
+        self.connection
+            .query_row(
+                "SELECT value FROM schema_metadata WHERE key = 'schema_version'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .context("schema metadata is missing")?
+            .parse::<u32>()
+            .context("schema version is not an unsigned integer")
+    }
+
     pub fn dashboard_snapshot(&self, database_path: &Path) -> Result<DashboardSnapshot> {
         let latest = self.latest_run()?;
         let events = self.recent_events(12)?;
+        let metrics = self.latest_portfolio_metrics()?;
         let recent_events = events
             .iter()
             .rev()
@@ -222,23 +313,37 @@ impl Store {
                 recent_events
             },
             database_path: database_path.display().to_string(),
+            portfolio_value: metrics.0,
+            buying_power: metrics.1,
+            realized_pnl: metrics.2,
         })
+    }
+
+    fn latest_portfolio_metrics(&self) -> Result<(Option<f64>, Option<f64>, Option<f64>)> {
+        self.connection
+            .query_row(
+                "SELECT total_value_usd, buying_power_usd, realized_pnl_usd FROM portfolio_snapshots ORDER BY id DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map(|value| value.unwrap_or((None, None, None)))
+            .map_err(Into::into)
+    }
+}
+
+impl BrokerDataSink for Store {
+    fn ingest_portfolio_snapshot(&self, snapshot: &PortfolioSnapshot) -> Result<()> {
+        self.insert_portfolio_snapshot(snapshot)
+    }
+
+    fn ingest_execution(&self, execution: &ExecutionRecord, run_id: Option<&str>) -> Result<()> {
+        self.insert_execution(execution, run_id)
     }
 }
 
 fn now() -> String {
     Utc::now().to_rfc3339()
-}
-
-fn number(object: &serde_json::Map<String, Value>, key: &str) -> Option<f64> {
-    object.get(key).and_then(Value::as_f64)
-}
-
-#[allow(dead_code)]
-fn _parse_timestamp(value: &str) -> Option<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(value)
-        .ok()
-        .map(|value| value.with_timezone(&Utc))
 }
 
 #[cfg(test)]
@@ -252,10 +357,11 @@ mod tests {
             .record_audit(None, "test", "created", &serde_json::json!({"ok": true}))
             .unwrap();
         assert!(store.latest_run().unwrap().is_none());
+        assert_eq!(store.schema_version().unwrap(), 3);
     }
 
     #[test]
-    fn records_and_reads_run_events() {
+    fn records_and_reads_run_events_and_tool_events() {
         let store = Store::open(Path::new(":memory:")).unwrap();
         store.begin_run("run-1", "crypto", "prompt").unwrap();
         store
@@ -268,7 +374,53 @@ mod tests {
                 recorded_at: now(),
             })
             .unwrap();
+        store
+            .record_tool_event(&AgentToolEventRecord {
+                run_id: "run-1".to_owned(),
+                sequence_number: 2,
+                tool_name: "get_portfolio".to_owned(),
+                input_json: Some("{}".to_owned()),
+                output_json: None,
+                is_error: false,
+                recorded_at: now(),
+            })
+            .unwrap();
         assert_eq!(store.recent_events(5).unwrap().len(), 1);
+        assert_eq!(store.tool_event_count("run-1").unwrap(), 1);
+        assert_eq!(store.tool_event_error_count("run-1").unwrap(), 0);
         assert_eq!(store.latest_run().unwrap().unwrap().lane, "crypto");
+    }
+
+    #[test]
+    fn ingests_normalized_broker_records() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        store
+            .begin_run("run-1", "equity_options", "prompt")
+            .unwrap();
+        store
+            .record_portfolio_snapshot(&serde_json::json!({
+                "portfolio_value": "1200.50",
+                "buying_power": 400
+            }))
+            .unwrap();
+        store
+            .record_execution(
+                &serde_json::json!({
+                    "id": "order-1",
+                    "symbol": "ABC",
+                    "side": "buy",
+                    "quantity": 2,
+                    "status": "filled"
+                }),
+                Some("run-1"),
+            )
+            .unwrap();
+        let snapshot = store
+            .dashboard_snapshot(Path::new("data/hoodrat.db"))
+            .unwrap();
+        assert_eq!(snapshot.portfolio_value, Some(1200.50));
+        assert_eq!(snapshot.buying_power, Some(400.0));
+        assert_eq!(store.portfolio_snapshot_count().unwrap(), 1);
+        assert_eq!(store.execution_count().unwrap(), 1);
     }
 }

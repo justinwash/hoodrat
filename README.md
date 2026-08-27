@@ -74,10 +74,12 @@ https://agent.robinhood.com/mcp/trading
 The documented Cline setup command is:
 
 ```text
-cline mcp add robinhood-trading --transport http https://agent.robinhood.com/mcp/trading
+cline --data-dir data/cline mcp add robinhood-trading --transport http https://agent.robinhood.com/mcp/trading
 ```
 
-Then authenticate the MCP server in Cline. Use:
+Then authenticate the server in Cline using that same `--data-dir`. The runner
+passes `--data-dir` on every fresh task, so configuring a different Cline data
+directory will not configure the profile Hoodrat uses. Use:
 
 ```text
 cargo run -- doctor
@@ -96,6 +98,10 @@ Run the scheduler in its current safe mode:
 ```text
 cargo run -- run
 ```
+
+The long-running scheduler reloads the config once per loop. Disengaging the
+persistent kill switch or otherwise making the readiness gate fail prevents
+future evaluations without requiring a process restart.
 
 The scheduler will not invoke Cline while execution is disabled or the kill
 switch is engaged. A one-shot run is useful for development:
@@ -125,6 +131,7 @@ The database defaults to `data/hoodrat.db`. It contains:
 
 - scheduled agent runs and their status;
 - parsed Cline JSON events plus raw output;
+- recognized Cline/MCP tool events, including inputs, outputs, and errors;
 - append-only audit events;
 - portfolio snapshots;
 - execution records;
@@ -141,7 +148,8 @@ store where applicable.
 - Rust risk checks are readiness and monitoring checks only under the direct
   MCP design; they are not a deterministic pre-trade firewall.
 - The scheduler does not yet calculate broker-confirmed PnL or reconstruct
-  fills from Robinhood; those data ingestion adapters are next.
+  fills from Robinhood. It only opportunistically normalizes clearly
+  recognizable portfolio/order tool results; unknown payloads remain raw.
 - Market hours are schedule guards, not an exchange calendar or an order
   execution guarantee.
 - No strategy recommends a symbol or trade. The strategy prompt is deliberately

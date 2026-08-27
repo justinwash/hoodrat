@@ -1,5 +1,6 @@
 mod agent;
 mod config;
+mod ingestion;
 mod readiness;
 mod scheduler;
 mod store;
@@ -8,7 +9,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use config::{default_config_path, Config};
 use readiness::check;
-use scheduler::run as run_scheduler;
+use scheduler::{run as run_scheduler, run_from_path as run_scheduler_from_path};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -98,6 +99,7 @@ fn doctor(config_path: &Path) -> Result<()> {
     println!("session mode: {:?}", config.agent.session_mode);
     println!("Robinhood MCP: {}", config.robinhood.trading_mcp_url);
     println!("MCP server name: {}", config.robinhood.mcp_server_name);
+    println!("database schema version: {}", _store.schema_version()?);
     println!("readiness: {}", report.status());
     for blocker in report.blockers {
         println!("  blocker: {blocker}");
@@ -123,16 +125,17 @@ fn doctor(config_path: &Path) -> Result<()> {
     println!();
     println!("Robinhood setup command documented by Robinhood:");
     println!(
-        "  cline mcp add robinhood-trading --transport http {}",
+        "  cline --data-dir {} mcp add robinhood-trading --transport http {}",
+        config.agent.data_dir.display(),
         config.robinhood.trading_mcp_url
     );
+    println!("Use the same --data-dir for Cline authentication and every Hoodrat run.");
     println!("Then authenticate the server in Cline and mark connection_ready=true only after verification.");
     Ok(())
 }
 
 fn run(config_path: PathBuf, once: bool) -> Result<()> {
-    let (config, store) = load_runtime(&config_path)?;
-    run_scheduler(&config, &store, once)
+    run_scheduler_from_path(&config_path, once)
 }
 
 fn dashboard(config_path: PathBuf) -> Result<()> {
@@ -142,9 +145,9 @@ fn dashboard(config_path: PathBuf) -> Result<()> {
     let window = MainWindow::new()?;
     window.set_bot_status(if report.ready { "LIVE READY" } else { "LOCKED" }.into());
     window.set_execution_mode(format!("mode: {:?}", config.execution.mode).into());
-    window.set_portfolio_value("—".into());
-    window.set_buying_power("—".into());
-    window.set_realized_pnl("—".into());
+    window.set_portfolio_value(format_money(snapshot.portfolio_value).into());
+    window.set_buying_power(format_money(snapshot.buying_power).into());
+    window.set_realized_pnl(format_money(snapshot.realized_pnl).into());
     window.set_last_run(snapshot.last_run.into());
     window.set_last_run_status(snapshot.last_run_status.into());
     window.set_database_path(snapshot.database_path.into());
@@ -170,6 +173,9 @@ fn dashboard(config_path: PathBuf) -> Result<()> {
             window.set_last_run(snapshot.last_run.into());
             window.set_last_run_status(snapshot.last_run_status.into());
             window.set_database_path(snapshot.database_path.into());
+            window.set_portfolio_value(format_money(snapshot.portfolio_value).into());
+            window.set_buying_power(format_money(snapshot.buying_power).into());
+            window.set_realized_pnl(format_money(snapshot.realized_pnl).into());
             window.set_recent_events(snapshot.recent_events.into());
             window.set_bot_status(
                 if check(&config).ready {
@@ -194,17 +200,24 @@ fn dashboard(config_path: PathBuf) -> Result<()> {
     });
 
     let run_window = window.as_weak();
-    let run_config = config.clone();
     let run_store = Arc::clone(&shared_store);
+    let run_config_path = config_path.clone();
     window.on_run_now(move || {
-        if !check(&run_config).ready {
+        let Ok((config, store)) = load_runtime(&run_config_path) else {
+            if let Some(window) = run_window.upgrade() {
+                window.set_last_run_status("unable to reload configuration".into());
+            }
+            return;
+        };
+        if !check(&config).ready {
             if let Some(window) = run_window.upgrade() {
                 window.set_last_run_status("blocked by readiness gate".into());
             }
             return;
         }
-        if let Ok(guard) = run_store.lock() {
-            let _ = run_scheduler(&run_config, &guard, true);
+        if let Ok(mut guard) = run_store.lock() {
+            *guard = store;
+            let _ = run_scheduler(&config, &guard, true);
         }
     });
 
@@ -228,4 +241,10 @@ fn dashboard(config_path: PathBuf) -> Result<()> {
 
     window.run()?;
     Ok(())
+}
+
+fn format_money(value: Option<f64>) -> String {
+    value
+        .map(|value| format!("${value:.2}"))
+        .unwrap_or_else(|| "—".to_owned())
 }

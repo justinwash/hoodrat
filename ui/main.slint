@@ -50,7 +50,11 @@ export component MainWindow inherits Window {
                 HorizontalBox {
                     padding: 12px;
                     spacing: 12px;
-                    Text { text: root.bot_status; color: #86efac; font-size: 18px; }
+                    Text {
+                        text: root.bot_status;
+                        color: root.bot_status == "LOCKED" ? #fca5a5 : #86efac;
+                        font-size: 18px;
+                    }
                     Text { text: root.execution_mode; color: #d1d5db; vertical-alignment: center; }
                 }
             }
