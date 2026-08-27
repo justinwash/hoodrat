@@ -334,7 +334,7 @@ fn default_cline_config_dir() -> PathBuf {
     PathBuf::from("data/cline")
 }
 fn default_provider() -> String {
-    "openai-compatible".to_owned()
+    "openrouter".to_owned()
 }
 fn default_model() -> String {
     "gpt-5.6-luna".to_owned()
@@ -417,6 +417,7 @@ mod tests {
         let decoded: Config = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.schema_version, 1);
         assert_eq!(decoded.agent.model, "gpt-5.6-luna");
+        assert_eq!(decoded.agent.provider, "openrouter");
     }
 
     #[test]

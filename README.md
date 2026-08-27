@@ -41,7 +41,7 @@ per-lane switches so they can be disabled independently.
 
 - Rust stable with Cargo.
 - A Cline CLI installation (`npm install -g cline`) for the initial prototype.
-- A configured Cline provider/gateway that exposes the configured model ID.
+- An OpenRouter account/API key with access to the configured model ID.
 - A Robinhood Agentic account.
 - Robinhood Trading MCP authorization completed in Cline.
 
@@ -82,9 +82,22 @@ The documented Cline setup command is:
 cline --config data/cline --data-dir data/cline/data mcp add --yes --json --transport http robinhood-trading https://agent.robinhood.com/mcp/trading
 ```
 
-Then authenticate the server in Cline using that same `--config` and
-`--data-dir`. The runner passes both flags on every fresh task, so configuring a
-different Cline profile will not configure the profile Hoodrat uses. Use:
+Then configure OpenRouter in that same Cline profile. The documented provider
+settings are OpenRouter, your OpenRouter API key, and model ID
+`gpt-5.6-luna`. The runner passes `--provider openrouter` on every fresh task.
+Use this Cline CLI auth command with the same `--config` and `--data-dir` (do
+not add `--baseurl` for standard OpenRouter), or enter the values in Cline's
+settings UI:
+
+```text
+cline --config data/cline --data-dir data/cline/data auth --provider openrouter --apikey "<OPENROUTER_KEY>" --modelid "gpt-5.6-luna"
+```
+
+Then complete Robinhood MCP OAuth in the same Cline profile. Cline's MCP
+settings may show an authorization-required state until that interactive step
+is complete. The runner passes both profile flags on every fresh task, so
+configuring a different Cline profile will not configure the profile Hoodrat
+uses. Use:
 
 ```text
 cargo run -- doctor
@@ -102,8 +115,10 @@ This command is separate from scheduled execution. It requires the application
 to remain disabled, the kill switch to remain engaged, and the risk policy to
 remain unconfirmed. It launches Cline with `--plan`, `--json`, and
 `--auto-approve false`, records the result in SQLite, and does not change the
-configuration. Plan mode and the prompt reduce write risk, but direct MCP
-access still means this is not an application-owned pre-trade firewall.
+configuration. A successful smoke test requires at least one successful
+read-only call to the configured Robinhood MCP server; a successful Cline exit
+alone is not sufficient. Plan mode and the prompt reduce write risk, but direct
+MCP access still means this is not an application-owned pre-trade firewall.
 
 Run the dashboard:
 

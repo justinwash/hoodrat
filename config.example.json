@@ -9,7 +9,7 @@
     "working_directory": null,
     "config_dir": "data/cline",
     "data_dir": "data/cline/data",
-    "provider": "openai-compatible",
+    "provider": "openrouter",
     "model": "gpt-5.6-luna",
     "timeout_secs": 300,
     "auto_approve": true,

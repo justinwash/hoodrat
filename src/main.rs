@@ -116,6 +116,13 @@ fn doctor(config_path: &Path) -> Result<()> {
         "Cline MCP settings: {}",
         settings_file_status(&config.agent.data_dir, "cline_mcp_settings.json")
     );
+    println!(
+        "Robinhood MCP authorization: {}",
+        robinhood_mcp_authorization_status(
+            &config.agent.data_dir,
+            &config.robinhood.mcp_server_name
+        )
+    );
     println!("Cline model: {}", config.agent.model);
     println!("Cline provider: {}", config.agent.provider);
     println!("session mode: {:?}", config.agent.session_mode);
@@ -152,7 +159,13 @@ fn doctor(config_path: &Path) -> Result<()> {
     println!(
         "Use the same --config and --data-dir for Cline authentication and every Hoodrat run."
     );
-    println!("Then authenticate the server in Cline and mark connection_ready=true only after verification.");
+    println!(
+        "OpenRouter auth: cline --config {} --data-dir {} auth --provider openrouter --apikey \"<KEY>\" --modelid \"{}\"",
+        config.agent.config_dir.display(),
+        config.agent.data_dir.display(),
+        config.agent.model
+    );
+    println!("Then complete Robinhood MCP OAuth in Cline and mark connection_ready=true only after a successful read-only smoke test.");
     Ok(())
 }
 
@@ -182,10 +195,20 @@ fn smoke_test(config_path: &Path) -> Result<()> {
     println!("Robinhood MCP: {}", config.robinhood.trading_mcp_url);
     println!("safety mode: plan=true, auto_approve=false");
 
-    let result = run_read_only_smoke_test(&config.agent, &store, &agent::ProcessAgentExecutor)?;
+    let result = run_read_only_smoke_test(
+        &config.agent,
+        &store,
+        &config.robinhood.mcp_server_name,
+        &agent::ProcessAgentExecutor,
+    )?;
     println!(
-        "smoke test run {} finished with exit={:?}, events={}, tool_events={}",
-        result.run_id, result.exit_code, result.event_count, result.tool_event_count
+        "smoke test run {} finished with exit={:?}, events={}, tool_events={}, robinhood_reads={}, mcp_errors={}",
+        result.run_id,
+        result.exit_code,
+        result.event_count,
+        result.tool_event_count,
+        result.robinhood_read_count,
+        result.mcp_error_count
     );
     println!(
         "portfolio snapshots ingested: {}",
@@ -197,6 +220,26 @@ fn smoke_test(config_path: &Path) -> Result<()> {
         anyhow::bail!(
             "Cline smoke-test process exited with {:?}",
             result.exit_code
+        );
+    }
+    if result.robinhood_read_count == 0 {
+        let authorization_status = robinhood_mcp_authorization_status(
+            &config.agent.data_dir,
+            &config.robinhood.mcp_server_name,
+        );
+        if authorization_status == "required" {
+            anyhow::bail!(
+                "Robinhood MCP was not verified: OAuth authorization is required for the configured server"
+            );
+        }
+        if result.mcp_error_count > 0 {
+            anyhow::bail!(
+                "Robinhood MCP was not verified: {} MCP call(s) reported errors; check Robinhood OAuth authorization",
+                result.mcp_error_count
+            );
+        }
+        anyhow::bail!(
+            "Robinhood MCP was not verified: no successful read tool call targeted the configured server"
         );
     }
     Ok(())
@@ -322,5 +365,31 @@ fn settings_file_status(data_dir: &Path, file_name: &str) -> &'static str {
         "present"
     } else {
         "missing"
+    }
+}
+
+fn robinhood_mcp_authorization_status(data_dir: &Path, server_name: &str) -> &'static str {
+    let path = data_dir.join("settings").join("cline_mcp_settings.json");
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return "unknown";
+    };
+    let Ok(settings) = serde_json::from_str::<serde_json::Value>(&contents) else {
+        return "unknown";
+    };
+    let Some(server) = settings
+        .get("mcpServers")
+        .and_then(|servers| servers.get(server_name))
+    else {
+        return "not configured";
+    };
+    if server
+        .get("oauth")
+        .and_then(|oauth| oauth.get("authorizationRequired"))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        "required"
+    } else {
+        "not marked required"
     }
 }
