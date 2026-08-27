@@ -1,6 +1,6 @@
 use crate::ingestion::{
-    parse_broker_payload, AccountRecord, BalanceRecord, BrokerDataSink, BrokerPayload,
-    ExecutionRecord, PnlSnapshot, PnlTradeRecord, PortfolioSnapshot, PositionRecord,
+    field_coverage, parse_broker_payload, AccountRecord, BalanceRecord, BrokerDataSink,
+    BrokerPayload, ExecutionRecord, PnlSnapshot, PnlTradeRecord, PortfolioSnapshot, PositionRecord,
 };
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -58,16 +58,21 @@ pub struct DashboardSnapshot {
     pub portfolio_value: Option<f64>,
     pub buying_power: Option<f64>,
     pub realized_pnl: Option<f64>,
+    pub reconciliation_status: String,
+    pub reconciliation_details: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ReconciliationReport {
+    pub captured_at: String,
     pub status: String,
     pub account_count: u32,
     pub balance_count: u32,
     pub position_count: u32,
     pub pnl_trade_count: u32,
     pub drift: Vec<String>,
+    pub coverage: BTreeMap<String, String>,
+    pub order_history_status: String,
 }
 
 pub struct Store {
@@ -88,6 +93,26 @@ impl Store {
         connection.execute_batch(TOOL_EVENTS_MIGRATION)?;
         connection.execute_batch(SCHEMA_METADATA_MIGRATION)?;
         connection.execute_batch(TYPED_BROKER_MIGRATION)?;
+        if !has_column(&connection, "reconciliation_runs", "coverage_json")?
+            || !has_column(&connection, "reconciliation_runs", "order_history_status")?
+        {
+            if !has_column(&connection, "reconciliation_runs", "coverage_json")? {
+                ensure_column(
+                    &connection,
+                    "reconciliation_runs",
+                    "coverage_json",
+                    "TEXT NOT NULL DEFAULT '{}'",
+                )?;
+            }
+            if !has_column(&connection, "reconciliation_runs", "order_history_status")? {
+                ensure_column(
+                    &connection,
+                    "reconciliation_runs",
+                    "order_history_status",
+                    "TEXT NOT NULL DEFAULT 'not_documented'",
+                )?;
+            }
+        }
         ensure_column(
             &connection,
             "broker_pnl_snapshots",
@@ -248,12 +273,14 @@ impl Store {
                 BrokerPayload::PnlTradeHistory(values) => pnl_trades.extend(values),
             }
         }
+        let coverage = reconciliation_coverage(raw_payloads)?;
         let fingerprint = fingerprint_json(
             &accounts,
             &balances,
             &positions,
             &pnl_snapshots,
             &pnl_trades,
+            &coverage,
         );
         let previous = self
             .connection
@@ -265,10 +292,15 @@ impl Store {
             .optional()?;
         let drift = previous
             .as_deref()
-            .filter(|old| *old != fingerprint)
-            .map(|_| vec!["account, balance, position, or PnL trade state changed since the last successful reconciliation".to_owned()])
+            .map(|old| {
+                let old_value = serde_json::from_str(old).unwrap_or(Value::Null);
+                let new_value = serde_json::from_str(&fingerprint).unwrap_or(Value::Null);
+                drift_categories(&old_value, &new_value)
+            })
             .unwrap_or_default();
-        let status = if previous.is_none() {
+        let status = if coverage_has_missing_required_data(&coverage) {
+            "coverage_incomplete"
+        } else if previous.is_none() {
             "baseline"
         } else if drift.is_empty() {
             "reconciled"
@@ -276,17 +308,20 @@ impl Store {
             "drift_detected"
         };
         let report = ReconciliationReport {
+            captured_at: now(),
             status: status.to_owned(),
             account_count: accounts.len() as u32,
             balance_count: balances.len() as u32,
             position_count: positions.len() as u32,
             pnl_trade_count: pnl_trades.len() as u32,
             drift,
+            coverage,
+            order_history_status: "not_documented".to_owned(),
         };
         self.connection.execute(
-            "INSERT INTO reconciliation_runs (captured_at, status, account_count, balance_count, position_count, pnl_trade_count, drift_json, raw_json, fingerprint_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO reconciliation_runs (captured_at, status, account_count, balance_count, position_count, pnl_trade_count, drift_json, raw_json, fingerprint_json, coverage_json, order_history_status) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
-                now(),
+                report.captured_at,
                 report.status,
                 report.account_count,
                 report.balance_count,
@@ -295,6 +330,8 @@ impl Store {
                 serde_json::to_string(&report.drift)?,
                 serde_json::to_string(raw_payloads)?,
                 fingerprint,
+                serde_json::to_string(&report.coverage)?,
+                report.order_history_status,
             ],
         )?;
         Ok(report)
@@ -304,17 +341,21 @@ impl Store {
     pub fn latest_reconciliation(&self) -> Result<Option<ReconciliationReport>> {
         self.connection
             .query_row(
-                "SELECT status, account_count, balance_count, position_count, pnl_trade_count, drift_json FROM reconciliation_runs ORDER BY id DESC LIMIT 1",
+                "SELECT captured_at, status, account_count, balance_count, position_count, pnl_trade_count, drift_json, coverage_json, order_history_status FROM reconciliation_runs ORDER BY id DESC LIMIT 1",
                 [],
                 |row| {
-                    let drift_json: String = row.get(5)?;
+                    let drift_json: String = row.get(6)?;
+                    let coverage_json: String = row.get(7)?;
                     Ok(ReconciliationReport {
-                        status: row.get(0)?,
-                        account_count: row.get(1)?,
-                        balance_count: row.get(2)?,
-                        position_count: row.get(3)?,
-                        pnl_trade_count: row.get(4)?,
+                        captured_at: row.get(0)?,
+                        status: row.get(1)?,
+                        account_count: row.get(2)?,
+                        balance_count: row.get(3)?,
+                        position_count: row.get(4)?,
+                        pnl_trade_count: row.get(5)?,
                         drift: serde_json::from_str(&drift_json).unwrap_or_default(),
+                        coverage: serde_json::from_str(&coverage_json).unwrap_or_default(),
+                        order_history_status: row.get(8)?,
                     })
                 },
             )
@@ -572,6 +613,7 @@ impl Store {
         let latest = self.latest_run()?;
         let events = self.recent_events(12)?;
         let metrics = self.latest_portfolio_metrics()?;
+        let reconciliation = self.latest_reconciliation()?;
         let recent_events = events
             .iter()
             .rev()
@@ -604,6 +646,14 @@ impl Store {
             portfolio_value: metrics.0,
             buying_power: metrics.1,
             realized_pnl: metrics.2,
+            reconciliation_status: reconciliation
+                .as_ref()
+                .map(|report| report.status.clone())
+                .unwrap_or_else(|| "not_run".to_owned()),
+            reconciliation_details: reconciliation
+                .as_ref()
+                .map(reconciliation_details)
+                .unwrap_or_else(|| "No reconciliation recorded.".to_owned()),
         })
     }
 
@@ -655,6 +705,158 @@ fn ensure_column(
     Ok(())
 }
 
+fn has_column(connection: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+    Ok(columns
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .iter()
+        .any(|name| name == column))
+}
+
+fn reconciliation_coverage(
+    raw_payloads: &BTreeMap<String, Value>,
+) -> Result<BTreeMap<String, String>> {
+    let mut coverage = BTreeMap::new();
+    coverage.insert(
+        "accounts".to_owned(),
+        coverage_for(raw_payloads, "get_accounts", &["accounts"])?,
+    );
+    coverage.insert(
+        "portfolio_total_value".to_owned(),
+        coverage_for(
+            raw_payloads,
+            "get_portfolio",
+            &["total_value", "total_value_usd", "portfolio_value"],
+        )?,
+    );
+    coverage.insert(
+        "portfolio_buying_power".to_owned(),
+        coverage_for(
+            raw_payloads,
+            "get_portfolio",
+            &["buying_power", "buying_power_usd"],
+        )?,
+    );
+    coverage.insert(
+        "portfolio_positions".to_owned(),
+        coverage_for(raw_payloads, "get_portfolio", &["positions", "holdings"])?,
+    );
+    coverage.insert(
+        "realized_pnl".to_owned(),
+        coverage_for(
+            raw_payloads,
+            "get_realized_pnl",
+            &["realized_gain", "realized_pnl", "total_returns"],
+        )?,
+    );
+    coverage.insert(
+        "pnl_trade_history".to_owned(),
+        coverage_for(raw_payloads, "get_pnl_trade_history", &["trades"])?,
+    );
+    coverage.insert("order_history".to_owned(), "not_documented".to_owned());
+    Ok(coverage)
+}
+
+fn coverage_has_missing_required_data(coverage: &BTreeMap<String, String>) -> bool {
+    [
+        "accounts",
+        "portfolio_total_value",
+        "portfolio_buying_power",
+        "realized_pnl",
+        "pnl_trade_history",
+    ]
+    .iter()
+    .any(|key| coverage.get(*key).map(String::as_str) == Some("missing"))
+}
+
+fn coverage_for(
+    raw_payloads: &BTreeMap<String, Value>,
+    tool_name: &str,
+    keys: &[&str],
+) -> Result<String> {
+    raw_payloads
+        .get(tool_name)
+        .map(|raw| field_coverage(raw, keys))
+        .unwrap_or_else(|| Ok("missing".to_owned()))
+}
+
+fn drift_categories(previous: &Value, current: &Value) -> Vec<String> {
+    let mut categories = [
+        ("accounts", "accounts_changed"),
+        ("balances", "balances_changed"),
+        ("positions", "positions_changed"),
+        ("pnl_trades", "trade_history_changed"),
+    ]
+    .into_iter()
+    .filter_map(|(key, category)| {
+        (previous.get(key) != current.get(key)).then_some(category.to_owned())
+    })
+    .collect::<Vec<_>>();
+    if !pnl_snapshots_match(previous.get("pnl_snapshots"), current.get("pnl_snapshots")) {
+        categories.push("pnl_changed".to_owned());
+    }
+    if previous.get("coverage").is_some() && previous.get("coverage") != current.get("coverage") {
+        categories.push("coverage_changed".to_owned());
+    }
+    categories
+}
+
+fn pnl_snapshots_match(previous: Option<&Value>, current: Option<&Value>) -> bool {
+    fn normalize(value: Option<&Value>) -> Value {
+        serde_json::Value::Array(
+            value
+                .and_then(Value::as_array)
+                .map(|snapshots| {
+                    snapshots
+                        .iter()
+                        .map(|snapshot| {
+                            serde_json::json!({
+                                "account_number": snapshot.get("account_number"),
+                                "span": snapshot.get("span"),
+                                "realized_pnl_usd": snapshot.get("realized_pnl_usd"),
+                                "total_returns_usd": snapshot.get("total_returns_usd"),
+                                "rate_of_realized_gain": snapshot.get("rate_of_realized_gain"),
+                                "total_rate_of_return": snapshot.get("total_rate_of_return"),
+                                "number_of_trades": snapshot.get("number_of_trades"),
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default(),
+        )
+    }
+
+    normalize(previous) == normalize(current)
+}
+
+fn reconciliation_details(report: &ReconciliationReport) -> String {
+    let mut details = format!(
+        "accounts={}, balances={}, positions={}, pnl_trades={}, order_history={}",
+        report.account_count,
+        report.balance_count,
+        report.position_count,
+        report.pnl_trade_count,
+        report.order_history_status
+    );
+    if !report.drift.is_empty() {
+        details.push_str("; drift=");
+        details.push_str(&report.drift.join(","));
+    }
+    if !report.coverage.is_empty() {
+        details.push_str("; coverage=");
+        details.push_str(
+            &report
+                .coverage
+                .iter()
+                .map(|(name, state)| format!("{name}:{state}"))
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+    }
+    details
+}
+
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
@@ -667,7 +869,7 @@ mod tests {
             .record_audit(None, "test", "created", &serde_json::json!({"ok": true}))
             .unwrap();
         assert!(store.latest_run().unwrap().is_none());
-        assert_eq!(store.schema_version().unwrap(), 4);
+        assert_eq!(store.schema_version().unwrap(), 5);
     }
 
     #[test]
@@ -765,9 +967,18 @@ mod tests {
         assert_eq!(first.account_count, 2);
         assert_eq!(first.position_count, 1);
         assert_eq!(first.pnl_trade_count, 1);
+        assert_eq!(first.order_history_status, "not_documented");
+        assert_eq!(first.coverage["pnl_trade_history"], "present");
         let second = store.finalize_reconciliation(&payloads).unwrap();
         assert_eq!(second.status, "reconciled");
-        assert!(store.latest_reconciliation().unwrap().is_some());
+        let latest = store.latest_reconciliation().unwrap().unwrap();
+        assert_eq!(latest.status, "reconciled");
+        assert_eq!(latest.coverage["order_history"], "not_documented");
+        assert!(store
+            .dashboard_snapshot(Path::new(":memory:"))
+            .unwrap()
+            .reconciliation_details
+            .contains("order_history=not_documented"));
 
         let mut changed = payloads.clone();
         changed.insert(
@@ -778,7 +989,47 @@ mod tests {
         );
         let drift = store.finalize_reconciliation(&changed).unwrap();
         assert_eq!(drift.status, "drift_detected");
-        assert_eq!(drift.drift.len(), 1);
+        assert!(drift.drift.contains(&"balances_changed".to_owned()));
+
+        let mut missing = payloads.clone();
+        missing.remove("get_realized_pnl");
+        let incomplete = store.finalize_reconciliation(&missing).unwrap();
+        assert_eq!(incomplete.status, "coverage_incomplete");
+        assert_eq!(incomplete.coverage["realized_pnl"], "missing");
+    }
+
+    #[test]
+    fn ignores_volatile_pnl_window_fields_when_comparing_fingerprints() {
+        let legacy = serde_json::json!({
+            "pnl_snapshots": [{
+                "account_number": "account-1",
+                "span": "day",
+                "start_date": "2026-08-27T04:00:00Z",
+                "end_date": "2026-08-27T19:54:41Z",
+                "realized_pnl_usd": 0.0,
+                "total_returns_usd": 0.0,
+                "rate_of_realized_gain": null,
+                "total_rate_of_return": 0.0,
+                "number_of_trades": 0,
+                "by_asset_class": [{"realized_gain": null}]
+            }]
+        });
+        let current = serde_json::json!({
+            "pnl_snapshots": [{
+                "account_number": "account-1",
+                "span": "day",
+                "realized_pnl_usd": 0.0,
+                "total_returns_usd": 0.0,
+                "rate_of_realized_gain": null,
+                "total_rate_of_return": 0.0,
+                "number_of_trades": 0
+            }]
+        });
+        assert!(pnl_snapshots_match(
+            legacy.get("pnl_snapshots"),
+            current.get("pnl_snapshots")
+        ));
+        assert!(drift_categories(&legacy, &current).is_empty());
     }
 }
 
@@ -788,6 +1039,7 @@ fn fingerprint_json(
     positions: &[PositionRecord],
     pnl_snapshots: &[PnlSnapshot],
     pnl_trades: &[PnlTradeRecord],
+    coverage: &BTreeMap<String, String>,
 ) -> String {
     let mut account_values = accounts
         .iter()
@@ -848,14 +1100,11 @@ fn fingerprint_json(
             serde_json::json!({
                 "account_number": snapshot.account_number,
                 "span": snapshot.span,
-                "start_date": snapshot.start_date,
-                "end_date": snapshot.end_date,
                 "realized_pnl_usd": snapshot.realized_pnl_usd,
                 "total_returns_usd": snapshot.total_returns_usd,
                 "rate_of_realized_gain": snapshot.rate_of_realized_gain,
                 "total_rate_of_return": snapshot.total_rate_of_return,
                 "number_of_trades": snapshot.number_of_trades,
-                "by_asset_class": snapshot.by_asset_class,
             })
         })
         .collect::<Vec<_>>();
@@ -883,6 +1132,7 @@ fn fingerprint_json(
         "positions": position_values,
         "pnl_snapshots": pnl_snapshot_values,
         "pnl_trades": pnl_values,
+        "coverage": coverage,
     })
     .to_string()
 }

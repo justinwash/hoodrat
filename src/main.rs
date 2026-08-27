@@ -321,9 +321,9 @@ fn reconcile(config_path: &Path) -> Result<()> {
     if result
         .reconciliation
         .as_ref()
-        .is_some_and(|report| report.status == "drift_detected")
+        .is_some_and(|report| !matches!(report.status.as_str(), "baseline" | "reconciled"))
     {
-        anyhow::bail!("Robinhood MCP reconciliation detected state drift");
+        anyhow::bail!("Robinhood MCP reconciliation did not establish a usable baseline");
     }
     Ok(())
 }
@@ -342,6 +342,8 @@ fn dashboard(config_path: PathBuf) -> Result<()> {
     window.set_portfolio_value(format_money(snapshot.portfolio_value).into());
     window.set_buying_power(format_money(snapshot.buying_power).into());
     window.set_realized_pnl(format_money(snapshot.realized_pnl).into());
+    window.set_reconciliation_status(snapshot.reconciliation_status.clone().into());
+    window.set_reconciliation_details(snapshot.reconciliation_details.clone().into());
     window.set_last_run(snapshot.last_run.into());
     window.set_last_run_status(snapshot.last_run_status.into());
     window.set_database_path(snapshot.database_path.into());
@@ -370,6 +372,8 @@ fn dashboard(config_path: PathBuf) -> Result<()> {
             window.set_portfolio_value(format_money(snapshot.portfolio_value).into());
             window.set_buying_power(format_money(snapshot.buying_power).into());
             window.set_realized_pnl(format_money(snapshot.realized_pnl).into());
+            window.set_reconciliation_status(snapshot.reconciliation_status.clone().into());
+            window.set_reconciliation_details(snapshot.reconciliation_details.clone().into());
             window.set_recent_events(snapshot.recent_events.into());
             window.set_bot_status(
                 if check(&config).ready {

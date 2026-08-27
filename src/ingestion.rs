@@ -176,10 +176,20 @@ impl AccountRecord {
                 })
             })
             .collect::<Vec<_>>();
-        if records.is_empty() {
-            anyhow::bail!("accounts payload contains no recognizable account records");
-        }
         Ok(records)
+    }
+}
+
+pub fn single_agentic_account(accounts: &[AccountRecord]) -> Result<String> {
+    let eligible = accounts
+        .iter()
+        .filter(|account| account.agentic_allowed == Some(true))
+        .map(|account| account.account_number.clone())
+        .collect::<Vec<_>>();
+    match eligible.as_slice() {
+        [account_number] => Ok(account_number.clone()),
+        [] => anyhow::bail!("accounts payload contains no agent-accessible account"),
+        _ => anyhow::bail!("accounts payload contains multiple agent-accessible accounts"),
     }
 }
 
@@ -399,19 +409,17 @@ impl PnlTradeRecord {
                 .filter_map(|object| Self::from_object(object, &captured_at, account_number))
                 .collect::<Vec<_>>()
         } else {
-            find_array(
+            let array = find_array(
                 &payload,
                 &["trades", "trade_history", "tradeHistory", "history"],
             )
             .or_else(|| find_value(&payload, "data").and_then(Value::as_array))
-            .map(|array| {
-                array
-                    .iter()
-                    .filter_map(Value::as_object)
-                    .filter_map(|object| Self::from_object(object, &captured_at, account_number))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default()
+            .context("trade history payload has no recognizable trade collection")?;
+            array
+                .iter()
+                .filter_map(Value::as_object)
+                .filter_map(|object| Self::from_object(object, &captured_at, account_number))
+                .collect::<Vec<_>>()
         };
         Ok(records)
     }
@@ -525,6 +533,28 @@ pub fn normalize_mcp_payload(raw: &Value) -> Result<Value> {
         anyhow::bail!("Robinhood MCP payload is not structured JSON");
     }
     Ok(value)
+}
+
+pub fn field_coverage(raw: &Value, keys: &[&str]) -> Result<String> {
+    let payload = normalize_mcp_payload(raw)?;
+    let mut found = false;
+    for key in keys {
+        let Some(value) = find_value(&payload, key) else {
+            continue;
+        };
+        found = true;
+        let is_empty = match value {
+            Value::Array(values) => values.is_empty(),
+            Value::Object(object) => object.is_empty(),
+            Value::String(text) => text.trim().is_empty(),
+            Value::Null => true,
+            _ => false,
+        };
+        if !is_empty {
+            return Ok("present".to_owned());
+        }
+    }
+    Ok(if found { "empty" } else { "missing" }.to_owned())
 }
 
 fn parse_balances(
@@ -778,6 +808,16 @@ mod tests {
     }
 
     #[test]
+    fn requires_exactly_one_agentic_account() {
+        let accounts = AccountRecord::from_value(&fixture("accounts")).unwrap();
+        assert_eq!(single_agentic_account(&accounts).unwrap(), "account-2");
+        assert!(single_agentic_account(&[]).is_err());
+        let mut multiple = accounts.clone();
+        multiple[0].agentic_allowed = Some(true);
+        assert!(single_agentic_account(&multiple).is_err());
+    }
+
+    #[test]
     fn parses_portfolio_fixture_into_balances_and_positions() {
         let (snapshot, balances, positions) =
             PortfolioSnapshot::from_value_for_account(&fixture("portfolio"), Some("account-1"))
@@ -804,6 +844,49 @@ mod tests {
     #[test]
     fn rejects_error_envelopes() {
         assert!(normalize_mcp_payload(&serde_json::json!({"isError": true})).is_err());
+    }
+
+    #[test]
+    fn distinguishes_missing_empty_and_present_collections() {
+        assert_eq!(
+            field_coverage(&serde_json::json!({"data": {"trades": []}}), &["trades"]).unwrap(),
+            "empty"
+        );
+        assert_eq!(
+            field_coverage(&serde_json::json!({"data": {}}), &["trades"]).unwrap(),
+            "missing"
+        );
+        assert_eq!(
+            field_coverage(
+                &serde_json::json!({"data": {"trades": [{"id": "trade-1"}]}}),
+                &["trades"]
+            )
+            .unwrap(),
+            "present"
+        );
+        assert_eq!(
+            field_coverage(
+                &serde_json::json!({
+                    "data": {
+                        "data_points": [{"realized_gain": null}],
+                        "total_returns": "0"
+                    }
+                }),
+                &["realized_gain", "realized_pnl", "total_returns"]
+            )
+            .unwrap(),
+            "present"
+        );
+    }
+
+    #[test]
+    fn accepts_empty_trade_history_as_a_valid_zero_state() {
+        let trades = PnlTradeRecord::from_value(
+            &serde_json::json!({"data": {"trades": []}}),
+            Some("account-1"),
+        )
+        .unwrap();
+        assert!(trades.is_empty());
     }
 
     #[test]

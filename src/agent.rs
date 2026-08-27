@@ -1,5 +1,8 @@
 use crate::config::AgentConfig;
-use crate::ingestion::{parse_json_text, BrokerDataSink, ExecutionRecord, PortfolioSnapshot};
+use crate::ingestion::{
+    parse_json_text, single_agentic_account, BrokerDataSink, BrokerPayload, ExecutionRecord,
+    PortfolioSnapshot,
+};
 use crate::store::{AgentEventRecord, AgentToolEventRecord, ReconciliationReport, Store};
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -399,6 +402,8 @@ fn run_task_with_executor<E: AgentExecutor>(
     let mut pending_tools = HashMap::new();
     let mut typed_payloads = BTreeMap::new();
     let mut typed_ingestion_error = None;
+    let mut expected_tool_counts = BTreeMap::new();
+    let mut selected_account_number = None;
 
     for (index, line) in raw_output.lines().enumerate() {
         let sequence_number = index as u32;
@@ -481,6 +486,11 @@ fn run_task_with_executor<E: AgentExecutor>(
             if let Some(expected_server) = options.expected_mcp_server.as_deref() {
                 let is_expected_read =
                     tool.is_expected_read(expected_server, options.expected_mcp_tools.as_ref());
+                if is_expected_read {
+                    *expected_tool_counts
+                        .entry(tool.target_name().to_ascii_lowercase())
+                        .or_insert(0) += 1;
+                }
                 if is_expected_read && !tool_is_error {
                     robinhood_read_count += 1;
                 }
@@ -505,16 +515,55 @@ fn run_task_with_executor<E: AgentExecutor>(
                         ));
                         continue;
                     };
-                    match store.ingest_typed_broker_payload(tool.target_name(), output) {
-                        Ok(_) => {
-                            typed_payloads.insert(tool.target_name().to_owned(), output.clone());
+                    if tool.target_name().eq_ignore_ascii_case("get_accounts") {
+                        match store.ingest_typed_broker_payload(tool.target_name(), output) {
+                            Ok(BrokerPayload::Accounts(accounts)) => {
+                                match single_agentic_account(&accounts) {
+                                    Ok(account_number) => {
+                                        selected_account_number = Some(account_number)
+                                    }
+                                    Err(error) => typed_ingestion_error = Some(error.to_string()),
+                                }
+                                typed_payloads
+                                    .insert(tool.target_name().to_owned(), output.clone());
+                            }
+                            Ok(_) => {
+                                typed_ingestion_error = Some(
+                                    "get_accounts returned the wrong typed payload".to_owned(),
+                                );
+                            }
+                            Err(error) => {
+                                typed_ingestion_error = Some(format!(
+                                    "typed ingestion for '{}' failed: {error:#}",
+                                    tool.target_name()
+                                ));
+                            }
                         }
-                        Err(error) => {
+                    } else if let Some(expected_account) = selected_account_number.as_deref() {
+                        if tool_account_number(tool.input.as_ref()) != Some(expected_account) {
                             typed_ingestion_error = Some(format!(
-                                "typed ingestion for '{}' failed: {error:#}",
+                                "{} did not pass the selected account identifier unchanged",
                                 tool.target_name()
                             ));
+                        } else {
+                            match store.ingest_typed_broker_payload(tool.target_name(), output) {
+                                Ok(_) => {
+                                    typed_payloads
+                                        .insert(tool.target_name().to_owned(), output.clone());
+                                }
+                                Err(error) => {
+                                    typed_ingestion_error = Some(format!(
+                                        "typed ingestion for '{}' failed: {error:#}",
+                                        tool.target_name()
+                                    ));
+                                }
+                            }
                         }
+                    } else {
+                        typed_ingestion_error = Some(format!(
+                            "{} was called before get_accounts selected an agent-accessible account",
+                            tool.target_name()
+                        ));
                     }
                 } else {
                     ingest_tool_output(store, &run_id, tool.target_name(), output_value.as_ref())?;
@@ -551,7 +600,18 @@ fn run_task_with_executor<E: AgentExecutor>(
     }
     let reconciliation = if options.strict_typed_ingestion && output.status.success() {
         let expected_count = options.expected_mcp_tools.as_ref().map_or(0, HashSet::len);
-        if let Some(error) = typed_ingestion_error.as_deref() {
+        let has_exact_tool_cardinality = options.expected_mcp_tools.as_ref().is_some_and(|tools| {
+            tools.iter().all(|tool| {
+                expected_tool_counts
+                    .get(&tool.to_ascii_lowercase())
+                    .copied()
+                    == Some(1)
+            })
+        });
+        if unexpected_tool_count > 0 {
+            status = "policy_violation";
+            None
+        } else if let Some(error) = typed_ingestion_error.as_deref() {
             status = "reconciliation_failed";
             summary.push_str("\nTyped ingestion error: ");
             summary.push_str(error);
@@ -559,7 +619,8 @@ fn run_task_with_executor<E: AgentExecutor>(
         } else if mcp_error_count > 0 {
             status = "reconciliation_failed";
             None
-        } else if robinhood_read_count as usize != expected_count
+        } else if !has_exact_tool_cardinality
+            || robinhood_read_count as usize != expected_count
             || typed_payloads.len() != expected_count
         {
             status = "reconciliation_incomplete";
@@ -577,7 +638,7 @@ fn run_task_with_executor<E: AgentExecutor>(
     if let Some(report) = reconciliation.as_ref() {
         status = match report.status.as_str() {
             "baseline" | "reconciled" | "drift_detected" => report.status.as_str(),
-            _ => status,
+            _ => "reconciliation_incomplete",
         };
     }
     store.finish_run(&run_id, status, &raw_output, &summary)?;
@@ -748,6 +809,19 @@ fn first_string(object: &serde_json::Map<String, Value>, keys: &[&str]) -> Optio
             .and_then(Value::as_str)
             .map(ToOwned::to_owned)
     })
+}
+
+fn tool_account_number(input: Option<&Value>) -> Option<&str> {
+    let object = input.and_then(Value::as_object)?;
+    object
+        .get("account_number")
+        .or_else(|| {
+            object
+                .get("arguments")
+                .and_then(|value| value.get("account_number"))
+        })
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
 }
 
 fn collect_tool_events(
@@ -1283,7 +1357,70 @@ mod tests {
         assert!(result.reconciliation.is_none());
         assert_eq!(
             store.latest_run().unwrap().unwrap().status,
+            "policy_violation"
+        );
+    }
+
+    #[test]
+    fn reconciliation_rejects_duplicate_required_reads() {
+        let output = concat!(
+            "{\"type\":\"agent_event\",\"event\":{\"type\":\"content_start\",\"contentType\":\"tool\",\"toolName\":\"robinhood-trading__get_accounts\",\"toolCallId\":\"accounts\",\"input\":{}}}\n",
+            "{\"type\":\"agent_event\",\"event\":{\"type\":\"content_end\",\"contentType\":\"tool\",\"toolName\":\"robinhood-trading__get_accounts\",\"toolCallId\":\"accounts\",\"output\":{\"structuredContent\":{\"data\":{\"accounts\":[{\"account_number\":\"account-1\",\"agentic_allowed\":true}]}}}}}\n",
+            "{\"type\":\"agent_event\",\"event\":{\"type\":\"content_start\",\"contentType\":\"tool\",\"toolName\":\"robinhood-trading__get_accounts\",\"toolCallId\":\"accounts-duplicate\",\"input\":{}}}\n",
+            "{\"type\":\"agent_event\",\"event\":{\"type\":\"content_end\",\"contentType\":\"tool\",\"toolName\":\"robinhood-trading__get_accounts\",\"toolCallId\":\"accounts-duplicate\",\"output\":{\"structuredContent\":{\"data\":{\"accounts\":[{\"account_number\":\"account-1\",\"agentic_allowed\":true}]}}}}}\n"
+        );
+        let executor = FakeExecutor {
+            stdout: output.as_bytes().to_vec(),
+            stderr: Vec::new(),
+            status: success_status(),
+        };
+        let store = Store::open(std::path::Path::new(":memory:")).unwrap();
+        let result = run_read_only_reconciliation(
+            &AgentConfig::default(),
+            &store,
+            "robinhood-trading",
+            &executor,
+        )
+        .unwrap();
+        assert_eq!(result.robinhood_read_count, 2);
+        assert_eq!(result.unexpected_tool_count, 0);
+        assert!(result.reconciliation.is_none());
+        assert_eq!(
+            store.latest_run().unwrap().unwrap().status,
             "reconciliation_incomplete"
+        );
+    }
+
+    #[test]
+    fn reconciliation_rejects_dependent_read_for_wrong_account() {
+        let output = concat!(
+            "{\"type\":\"agent_event\",\"event\":{\"type\":\"content_start\",\"contentType\":\"tool\",\"toolName\":\"robinhood-trading__get_accounts\",\"toolCallId\":\"accounts\",\"input\":{}}}\n",
+            "{\"type\":\"agent_event\",\"event\":{\"type\":\"content_end\",\"contentType\":\"tool\",\"toolName\":\"robinhood-trading__get_accounts\",\"toolCallId\":\"accounts\",\"output\":{\"structuredContent\":{\"data\":{\"accounts\":[{\"account_number\":\"account-1\",\"agentic_allowed\":true}]}}}}}\n",
+            "{\"type\":\"agent_event\",\"event\":{\"type\":\"content_start\",\"contentType\":\"tool\",\"toolName\":\"use_mcp_tool\",\"toolCallId\":\"portfolio\",\"input\":{\"server_name\":\"robinhood-trading\",\"tool_name\":\"get_portfolio\",\"arguments\":{\"account_number\":\"account-2\"}}}}\n",
+            "{\"type\":\"agent_event\",\"event\":{\"type\":\"content_end\",\"contentType\":\"tool\",\"toolName\":\"use_mcp_tool\",\"toolCallId\":\"portfolio\",\"output\":{\"structuredContent\":{\"data\":{\"total_value\":\"100\",\"buying_power\":\"50\"}}}}}\n",
+            "{\"type\":\"agent_event\",\"event\":{\"type\":\"content_start\",\"contentType\":\"tool\",\"toolName\":\"robinhood-trading__get_realized_pnl\",\"toolCallId\":\"pnl\",\"input\":{\"account_number\":\"account-1\"}}}\n",
+            "{\"type\":\"agent_event\",\"event\":{\"type\":\"content_end\",\"contentType\":\"tool\",\"toolName\":\"robinhood-trading__get_realized_pnl\",\"toolCallId\":\"pnl\",\"output\":{\"structuredContent\":{\"data\":{\"realized_gain\":\"1.25\"}}}}}\n",
+            "{\"type\":\"agent_event\",\"event\":{\"type\":\"content_start\",\"contentType\":\"tool\",\"toolName\":\"robinhood-trading__get_pnl_trade_history\",\"toolCallId\":\"history\",\"input\":{\"account_number\":\"account-1\"}}}\n",
+            "{\"type\":\"agent_event\",\"event\":{\"type\":\"content_end\",\"contentType\":\"tool\",\"toolName\":\"robinhood-trading__get_pnl_trade_history\",\"toolCallId\":\"history\",\"output\":{\"structuredContent\":{\"data\":{\"trades\":[]}}}}}\n"
+        );
+        let executor = FakeExecutor {
+            stdout: output.as_bytes().to_vec(),
+            stderr: Vec::new(),
+            status: success_status(),
+        };
+        let store = Store::open(std::path::Path::new(":memory:")).unwrap();
+        let result = run_read_only_reconciliation(
+            &AgentConfig::default(),
+            &store,
+            "robinhood-trading",
+            &executor,
+        )
+        .unwrap();
+        assert_eq!(result.robinhood_read_count, 4);
+        assert!(result.reconciliation.is_none());
+        assert_eq!(
+            store.latest_run().unwrap().unwrap().status,
+            "reconciliation_failed"
         );
     }
 }

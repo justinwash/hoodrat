@@ -6,6 +6,8 @@ export component MainWindow inherits Window {
     in property <string> portfolio_value: "—";
     in property <string> buying_power: "—";
     in property <string> realized_pnl: "—";
+    in property <string> reconciliation_status: "not_run";
+    in property <string> reconciliation_details: "No reconciliation recorded.";
     in property <string> last_run: "No runs recorded";
     in property <string> last_run_status: "—";
     in property <string> database_path: "—";
@@ -41,6 +43,16 @@ export component MainWindow inherits Window {
             Button { text: "Refresh"; clicked => { root.refresh(); } }
             Button { text: "Run evaluation"; clicked => { root.run_now(); } }
             Button { text: "Toggle kill switch"; clicked => { root.toggle_kill_switch(); } }
+        }
+
+        GroupBox {
+            title: "Read-only reconciliation";
+            VerticalBox {
+                padding: 12px;
+                spacing: 6px;
+                Text { text: root.reconciliation_status; color: root.reconciliation_status == "baseline" || root.reconciliation_status == "reconciled" ? #86efac : #fca5a5; font-size: 16px; }
+                Text { text: root.reconciliation_details; color: #d1d5db; font-size: 12px; wrap: word-wrap; }
+            }
         }
 
         HorizontalBox {

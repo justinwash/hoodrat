@@ -134,9 +134,22 @@ It permits exactly four Robinhood reads—`get_accounts`, `get_portfolio`,
 `get_realized_pnl`, and `get_pnl_trade_history`—and persists both the raw MCP
 envelopes and recognized typed records. The first successful run establishes a
 baseline. Later successful runs compare account, balance, position, PnL, and
-realized-trade fingerprints; detected drift blocks scheduler lanes until it is
-reviewed. Any missing read, MCP error, typed parsing error, or non-Robinhood
-tool use blocks reconciliation.
+realized-trade fingerprints; detected drift is categorized and blocks scheduler
+lanes until it is reviewed. Required response fields are classified as
+`present`, `empty`, or `missing`; missing required data produces
+`coverage_incomplete`, while an empty collection is accepted as a valid zero
+state. The reconciliation also requires exactly one successful call per
+permitted tool, exactly one agent-accessible account, and unchanged account
+identifiers on dependent reads. Any missing read, duplicate read, MCP error,
+typed parsing error, wrong-account read, or non-Robinhood tool use blocks
+reconciliation.
+
+Robinhood's current Trading MCP documentation describes transaction and order
+history as readable account data, but does not document a dedicated
+order-history MCP tool. Hoodrat therefore records full order-history coverage
+as `not_documented` and does not invent or call an unsupported tool. The
+documented `get_pnl_trade_history` read is persisted separately as realized-PnL
+trade history.
 
 Run the dashboard:
 
@@ -187,7 +200,8 @@ The database defaults to `data/hoodrat.db`. It contains:
 - portfolio snapshots;
 - execution records;
 - typed broker accounts, balances, positions, realized PnL snapshots, and PnL trade history;
-- reconciliation runs, raw read payloads, stable fingerprints, and drift status;
+- reconciliation runs, raw read payloads, stable fingerprints, categorized drift,
+  response coverage, and order-history coverage status;
 - schema version metadata.
 
 No API keys or Robinhood credentials belong in `hoodrat.json` or SQLite. Keep
@@ -200,10 +214,11 @@ store where applicable.
 - It does not infer or intercept every order tool call inside Cline output.
 - Rust risk checks are readiness and monitoring checks only under the direct
   MCP design; they are not a deterministic pre-trade firewall.
-- The typed reconciliation currently covers the documented account, portfolio,
+- The typed reconciliation covers the documented account, portfolio,
   realized-PnL, and realized-PnL trade-history reads. It does not infer a full
   order ledger from those reads; order/execution records remain a separate
-  opportunistic ingestion path until a documented order-history read is added.
+  opportunistic ingestion path because the current Robinhood documentation
+  does not name a dedicated order-history MCP read.
 - Market hours are schedule guards, not an exchange calendar or an order
   execution guarantee.
 - No strategy recommends a symbol or trade. The strategy prompt is deliberately

@@ -157,7 +157,7 @@ fn run_startup_reconciliation(config: &Config, store: &Store) -> Result<bool> {
     let ready = result.exit_code == Some(0)
         && result.mcp_error_count == 0
         && result.unexpected_tool_count == 0
-        && report.is_some_and(|report| report.status != "drift_detected");
+        && report.is_some_and(|report| reconciliation_status_allows_scheduler(&report.status));
     store.record_audit(
         None,
         "reconciliation",
@@ -174,6 +174,10 @@ fn run_startup_reconciliation(config: &Config, store: &Store) -> Result<bool> {
         eprintln!("scheduler lanes blocked by startup reconciliation");
     }
     Ok(ready)
+}
+
+fn reconciliation_status_allows_scheduler(status: &str) -> bool {
+    matches!(status, "baseline" | "reconciled")
 }
 
 fn load_config(config_path: &Path) -> Result<Config> {
@@ -272,5 +276,18 @@ mod tests {
         let mut config = Config::default();
         config.schedule.equity_options.timezone = "not-a-timezone".to_owned();
         assert!(!equity_options_open(&config));
+    }
+
+    #[test]
+    fn only_successful_reconciliation_statuses_allow_scheduler_lanes() {
+        assert!(reconciliation_status_allows_scheduler("baseline"));
+        assert!(reconciliation_status_allows_scheduler("reconciled"));
+        assert!(!reconciliation_status_allows_scheduler(
+            "coverage_incomplete"
+        ));
+        assert!(!reconciliation_status_allows_scheduler("drift_detected"));
+        assert!(!reconciliation_status_allows_scheduler(
+            "reconciliation_failed"
+        ));
     }
 }

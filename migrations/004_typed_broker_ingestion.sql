@@ -103,7 +103,9 @@ CREATE TABLE IF NOT EXISTS reconciliation_runs (
     pnl_trade_count INTEGER NOT NULL,
     drift_json TEXT NOT NULL,
     raw_json TEXT NOT NULL,
-    fingerprint_json TEXT NOT NULL
+    fingerprint_json TEXT NOT NULL,
+    coverage_json TEXT NOT NULL DEFAULT '{}',
+    order_history_status TEXT NOT NULL DEFAULT 'not_documented'
 );
 
 CREATE INDEX IF NOT EXISTS idx_reconciliation_runs_captured_at
