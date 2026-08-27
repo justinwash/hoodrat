@@ -113,12 +113,14 @@ cargo run -- smoke-test
 
 This command is separate from scheduled execution. It requires the application
 to remain disabled, the kill switch to remain engaged, and the risk policy to
-remain unconfirmed. It launches Cline with `--plan`, `--json`, and
-`--auto-approve false`, records the result in SQLite, and does not change the
-configuration. A successful smoke test requires at least one successful
-read-only call to the configured Robinhood MCP server; a successful Cline exit
-alone is not sufficient. Plan mode and the prompt reduce write risk, but direct
-MCP access still means this is not an application-owned pre-trade firewall.
+remain unconfirmed. It launches Cline with `--plan`, `--json`, `--auto-approve true`,
+and `--retries 1`, records the result in SQLite, and does not change the
+configuration. Auto-approval is required for Cline's headless MCP call to run;
+the smoke-test system prompt permits only the single read-only `get_accounts`
+probe, and the supervisor requires that successful read to be the only tool
+call observed. A successful Cline exit alone is not sufficient. Plan mode and
+the prompt reduce write risk, but direct MCP access still means this is not an
+application-owned pre-trade firewall.
 
 Run the dashboard:
 

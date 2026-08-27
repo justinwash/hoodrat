@@ -71,6 +71,14 @@ impl AgentCommand {
             "--config".to_owned(),
             config.config_dir.display().to_string(),
         ]);
+        if system_prompt.is_some() {
+            args.extend([
+                "--retries".to_owned(),
+                "1".to_owned(),
+                "--thinking".to_owned(),
+                "none".to_owned(),
+            ]);
+        }
         if let Some(system_prompt) = system_prompt {
             args.extend(["--system".to_owned(), system_prompt]);
         }
@@ -188,6 +196,7 @@ pub struct AgentRunResult {
     pub tool_event_count: u32,
     pub robinhood_read_count: u32,
     pub mcp_error_count: u32,
+    pub unexpected_tool_count: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -274,7 +283,7 @@ pub fn run_read_only_smoke_test<E: AgentExecutor>(
         build_smoke_test_prompt(robinhood_server_name),
         AgentTaskOptions {
             plan_mode: true,
-            auto_approve: false,
+            auto_approve: true,
             system_prompt: Some(build_smoke_test_system_prompt(robinhood_server_name)),
             expected_mcp_server: Some(robinhood_server_name.to_owned()),
         },
@@ -290,14 +299,7 @@ fn build_smoke_test_system_prompt(server_name: &str) -> String {
 
 fn build_smoke_test_prompt(server_name: &str) -> String {
     format!(
-        "Perform a READ-ONLY Robinhood Trading MCP connectivity test using only\n\
-the configured MCP server '{server_name}'. Your first action must be a read\n\
-call to that server. Use the MCP tool named 'get_accounts' if available, then\n\
-read-only calls for 'get_portfolio', 'get_realized_pnl', and\n\
-'get_pnl_trade_history'. Do not call any write-capable tool.\n\n\
-For every requested read, report success or the exact unavailable/auth error.\n\
-Return a concise connectivity report with non-sensitive fields only. This is\n\
-not an investment recommendation and must not change Robinhood state."
+        "Perform exactly one READ-ONLY Robinhood Trading MCP connectivity probe using only the configured MCP server '{server_name}'. Call only the read-only MCP tool 'get_accounts' on that server, then stop. Do not call any other tool, including skills, shell, filesystem, browser, delegation, coding, or any other MCP tool. Do not place, cancel, replace, or preview an order. Do not modify Robinhood state. Return only whether the get_accounts read succeeded and non-sensitive metadata."
     )
 }
 
@@ -341,6 +343,7 @@ fn run_task_with_executor<E: AgentExecutor>(
     let mut tool_event_count = 0;
     let mut robinhood_read_count = 0;
     let mut mcp_error_count = 0;
+    let mut unexpected_tool_count = 0;
     let mut pending_tools = HashMap::new();
 
     for (index, line) in raw_output.lines().enumerate() {
@@ -413,13 +416,23 @@ fn run_task_with_executor<E: AgentExecutor>(
             if tool.is_error {
                 mcp_error_count += u32::from(tool.server_name.is_some());
             }
-            if options.expected_mcp_server.as_deref() == tool.server_name.as_deref()
-                && !tool.is_error
-                && tool.is_allowed_read()
-            {
-                robinhood_read_count += 1;
+            if let Some(expected_server) = options.expected_mcp_server.as_deref() {
+                let is_expected_read = tool.is_smoke_read(expected_server);
+                if is_expected_read && !tool.is_error {
+                    robinhood_read_count += 1;
+                }
+                if !is_expected_read {
+                    unexpected_tool_count += 1;
+                }
             }
-            ingest_tool_output(store, &run_id, tool.target_name(), output_value.as_ref())?;
+            if options.expected_mcp_server.is_none()
+                || options
+                    .expected_mcp_server
+                    .as_deref()
+                    .is_some_and(|server| tool.is_smoke_read(server) && !tool.is_error)
+            {
+                ingest_tool_output(store, &run_id, tool.target_name(), output_value.as_ref())?;
+            }
         }
     }
 
@@ -445,6 +458,10 @@ fn run_task_with_executor<E: AgentExecutor>(
     {
         status = "mcp_not_verified";
     }
+    if output.status.success() && options.expected_mcp_server.is_some() && unexpected_tool_count > 0
+    {
+        status = "policy_violation";
+    }
     store.finish_run(&run_id, status, &raw_output, &summary)?;
     store.record_audit(
         Some(&run_id),
@@ -457,6 +474,7 @@ fn run_task_with_executor<E: AgentExecutor>(
             "tool_event_count": tool_event_count,
             "robinhood_read_count": robinhood_read_count,
             "mcp_error_count": mcp_error_count,
+            "unexpected_tool_count": unexpected_tool_count,
             "elapsed_ms": started.elapsed().as_millis(),
         }),
     )?;
@@ -468,6 +486,7 @@ fn run_task_with_executor<E: AgentExecutor>(
         tool_event_count,
         robinhood_read_count,
         mcp_error_count,
+        unexpected_tool_count,
     })
 }
 
@@ -493,6 +512,7 @@ impl ToolEvent {
         self.mcp_tool_name.as_deref().unwrap_or(&self.name)
     }
 
+    #[allow(dead_code)]
     fn is_allowed_read(&self) -> bool {
         matches!(
             self.target_name().to_ascii_lowercase().as_str(),
@@ -509,6 +529,11 @@ impl ToolEvent {
                 | "get_financials"
                 | "get_equity_price_book"
         )
+    }
+
+    fn is_smoke_read(&self, expected_server: &str) -> bool {
+        self.server_name.as_deref() == Some(expected_server)
+            && self.target_name().eq_ignore_ascii_case("get_accounts")
     }
 }
 
@@ -546,6 +571,7 @@ fn tool_event(value: &Value) -> Option<ToolEvent> {
             .and_then(Value::as_str)
             .map(ToOwned::to_owned)
     });
+    let (composite_server_name, composite_tool_name) = split_mcp_tool_name(name);
     let mcp_tool_name = first_string(object, &["mcp_tool_name", "mcpToolName"]).or_else(|| {
         if name == "use_mcp_tool" {
             input
@@ -572,9 +598,15 @@ fn tool_event(value: &Value) -> Option<ToolEvent> {
                     .map(|value| value.contains("error"))
                     .unwrap_or(false)
             }),
-        server_name,
-        mcp_tool_name,
+        server_name: server_name.or(composite_server_name),
+        mcp_tool_name: mcp_tool_name.or(composite_tool_name),
     })
+}
+
+fn split_mcp_tool_name(name: &str) -> (Option<String>, Option<String>) {
+    name.split_once("__")
+        .map(|(server, tool)| (Some(server.to_owned()), Some(tool.to_owned())))
+        .unwrap_or((None, None))
 }
 
 fn first_value(object: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<Value> {
@@ -604,6 +636,7 @@ fn collect_tool_events(
     let Some(name) = first_string(event, &["toolName", "tool_name", "name"]) else {
         return Vec::new();
     };
+    let (composite_server_name, composite_tool_name) = split_mcp_tool_name(&name);
     let call_id = first_string(event, &["toolCallId", "tool_call_id"]);
     let input = first_value(event, &["input", "arguments", "tool_input", "toolInput"]);
     let server_name = input.as_ref().and_then(|value| {
@@ -624,6 +657,8 @@ fn collect_tool_events(
     } else {
         None
     };
+    let server_name = server_name.or(composite_server_name);
+    let mcp_tool_name = mcp_tool_name.or(composite_tool_name);
     let content_type = event
         .get("type")
         .and_then(Value::as_str)
@@ -825,25 +860,42 @@ mod tests {
     }
 
     #[test]
-    fn smoke_test_command_forces_plan_and_no_auto_approval() {
+    fn smoke_test_command_forces_safe_probe_flags() {
         let config = AgentConfig::default();
         let command = AgentCommand::from_config_with_options(
             &config,
             "smoke prompt".to_owned(),
             true,
-            false,
+            true,
             Some("single-line system prompt".to_owned()),
         );
         assert_eq!(command.args.first(), Some(&"--plan".to_owned()));
         assert!(command
             .args
             .windows(2)
-            .any(|pair| pair == ["--auto-approve", "false"]));
+            .any(|pair| pair == ["--auto-approve", "true"]));
+        assert!(command
+            .args
+            .windows(2)
+            .any(|pair| pair == ["--retries", "1"]));
         assert!(command
             .args
             .windows(2)
             .any(|pair| pair == ["--system", "single-line system prompt"]));
         assert_eq!(command.args.last(), Some(&"smoke prompt".to_owned()));
+    }
+
+    #[test]
+    fn parses_current_composite_mcp_tool_name() {
+        let value = serde_json::json!({
+            "type": "mcp_tool_result",
+            "toolName": "robinhood-trading__get_accounts",
+            "result": {"accounts": []}
+        });
+        let event = tool_event(&value).unwrap();
+        assert_eq!(event.server_name.as_deref(), Some("robinhood-trading"));
+        assert_eq!(event.mcp_tool_name.as_deref(), Some("get_accounts"));
+        assert!(event.is_allowed_read());
     }
 
     #[test]
@@ -949,11 +1001,19 @@ mod tests {
             ..AgentConfig::default()
         };
         let store = Store::open(std::path::Path::new(":memory:")).unwrap();
-        let result =
-            run_read_only_smoke_test(&config, &store, "robinhood-trading", &executor).unwrap();
+        let result = run_fresh_task_with_executor(
+            &config,
+            &store,
+            Lane::EquityOptions,
+            "context",
+            "policy",
+            &executor,
+        )
+        .unwrap();
         assert_eq!(result.event_count, 4);
         assert_eq!(result.tool_event_count, 1);
-        assert_eq!(result.robinhood_read_count, 1);
+        assert_eq!(result.robinhood_read_count, 0);
+        assert_eq!(result.unexpected_tool_count, 0);
         assert_eq!(store.tool_event_count(&result.run_id).unwrap(), 1);
         assert_eq!(store.portfolio_snapshot_count().unwrap(), 1);
         assert!(store
@@ -1009,6 +1069,35 @@ mod tests {
         assert_eq!(
             store.latest_run().unwrap().unwrap().status,
             "mcp_not_verified"
+        );
+    }
+
+    #[test]
+    fn smoke_test_rejects_unexpected_tool_calls() {
+        let output = concat!(
+            "{\"type\":\"agent_event\",\"event\":{\"type\":\"content_start\",\"contentType\":\"tool\",\"toolName\":\"skills\",\"toolCallId\":\"call-skill\",\"input\":{\"skill\":\"example\"}}}\n",
+            "{\"type\":\"agent_event\",\"event\":{\"type\":\"content_end\",\"contentType\":\"tool\",\"toolName\":\"skills\",\"toolCallId\":\"call-skill\",\"output\":{\"ok\":true}}}\n",
+            "{\"type\":\"agent_event\",\"event\":{\"type\":\"content_start\",\"contentType\":\"tool\",\"toolName\":\"robinhood-trading__get_accounts\",\"toolCallId\":\"call-rh\",\"input\":{}}}\n",
+            "{\"type\":\"agent_event\",\"event\":{\"type\":\"content_end\",\"contentType\":\"tool\",\"toolName\":\"robinhood-trading__get_accounts\",\"toolCallId\":\"call-rh\",\"output\":{\"accounts\":[]}}}\n"
+        );
+        let executor = FakeExecutor {
+            stdout: output.as_bytes().to_vec(),
+            stderr: Vec::new(),
+            status: success_status(),
+        };
+        let store = Store::open(std::path::Path::new(":memory:")).unwrap();
+        let result = run_read_only_smoke_test(
+            &AgentConfig::default(),
+            &store,
+            "robinhood-trading",
+            &executor,
+        )
+        .unwrap();
+        assert_eq!(result.robinhood_read_count, 1);
+        assert_eq!(result.unexpected_tool_count, 1);
+        assert_eq!(
+            store.latest_run().unwrap().unwrap().status,
+            "policy_violation"
         );
     }
 }

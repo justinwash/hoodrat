@@ -193,7 +193,9 @@ fn smoke_test(config_path: &Path) -> Result<()> {
     );
     println!("Cline data directory: {}", config.agent.data_dir.display());
     println!("Robinhood MCP: {}", config.robinhood.trading_mcp_url);
-    println!("safety mode: plan=true, auto_approve=false");
+    println!(
+        "safety mode: plan=true, auto_approve=true, retries=1, read probe restricted by prompt"
+    );
 
     let result = run_read_only_smoke_test(
         &config.agent,
@@ -202,13 +204,14 @@ fn smoke_test(config_path: &Path) -> Result<()> {
         &agent::ProcessAgentExecutor,
     )?;
     println!(
-        "smoke test run {} finished with exit={:?}, events={}, tool_events={}, robinhood_reads={}, mcp_errors={}",
+        "smoke test run {} finished with exit={:?}, events={}, tool_events={}, robinhood_reads={}, mcp_errors={}, unexpected_tools={}",
         result.run_id,
         result.exit_code,
         result.event_count,
         result.tool_event_count,
         result.robinhood_read_count,
-        result.mcp_error_count
+        result.mcp_error_count,
+        result.unexpected_tool_count
     );
     println!(
         "portfolio snapshots ingested: {}",
@@ -220,6 +223,12 @@ fn smoke_test(config_path: &Path) -> Result<()> {
         anyhow::bail!(
             "Cline smoke-test process exited with {:?}",
             result.exit_code
+        );
+    }
+    if result.unexpected_tool_count > 0 {
+        anyhow::bail!(
+            "Robinhood MCP smoke test policy violation: {} unexpected tool call(s) were observed",
+            result.unexpected_tool_count
         );
     }
     if result.robinhood_read_count == 0 {
