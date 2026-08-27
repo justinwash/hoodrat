@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "execution": {
+    "mode": "disabled",
+    "kill_switch_engaged": true
+  },
+  "agent": {
+    "executable": "cline",
+    "working_directory": null,
+    "data_dir": "data/cline",
+    "provider": "openai-compatible",
+    "model": "gpt-5.6-luna",
+    "timeout_secs": 300,
+    "auto_approve": true,
+    "session_mode": "fresh"
+  },
+  "robinhood": {
+    "trading_mcp_url": "https://agent.robinhood.com/mcp/trading",
+    "mcp_server_name": "robinhood-trading",
+    "agentic_account_only": true,
+    "connection_ready": false
+  },
+  "schedule": {
+    "equity_options": {
+      "enabled": true,
+      "interval_secs": 300,
+      "timezone": "America/New_York",
+      "start_local": "09:35",
+      "end_local": "15:55"
+    },
+    "crypto": {
+      "enabled": true,
+      "interval_secs": 900
+    }
+  },
+  "risk": {
+    "confirmed": false,
+    "max_order_notional_usd": 1000.0,
+    "daily_loss_limit_usd": 250.0,
+    "max_total_exposure_usd": 5000.0,
+    "max_concurrent_positions": 10,
+    "max_option_dte": 1,
+    "max_crypto_exposure_usd": 1000.0,
+    "max_bid_ask_spread_bps": 150,
+    "max_quote_age_secs": 30,
+    "duplicate_order_cooldown_secs": 60
+  },
+  "storage": {
+    "database_path": "data/hoodrat.db"
+  },
+  "ui": {
+    "refresh_secs": 2
+  }
+}

@@ -1,5 +1,7 @@
-/target
+/target/
+/data/
+/hoodrat.json
+*.db
+*.db-shm
+*.db-wal
 .env
-*.env.local
-Cargo.lock
-.claude/

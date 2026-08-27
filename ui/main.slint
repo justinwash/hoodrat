@@ -1,934 +1,114 @@
-import { Button, ListView, LineEdit } from "std-widgets.slint";
-
-// ---------------------------------------------------------------------------
-// Data types shared with Rust
-// ---------------------------------------------------------------------------
-
-export struct TradeEntry {
-    side: string,
-    symbol: string,
-    quantity: string,
-    price: string,
-    total: string,
-    is-buy: bool,
-}
-
-export struct LogEntry {
-    kind: string,   // "tool" | "result" | "analysis" | "status" | "error"
-    text: string,
-}
-
-export struct PositionEntry {
-    symbol: string,
-    detail: string,   // options descriptor e.g. "530C 7/18", empty for equity
-    qty: string,
-    avg: string,
-    current: string,
-    pnl: string,
-    is-gain: bool,
-}
-
-export struct TickerEntry {
-    symbol: string,
-    selected: bool,
-}
-
-// ---------------------------------------------------------------------------
-// Reusable stat row (portfolio panel)
-// ---------------------------------------------------------------------------
-
-component StatRow inherits Rectangle {
-    height: 24px;
-    in property <string> label;
-    in property <string> value;
-    in property <color> value-color: #c9d1d9;
-
-    HorizontalLayout {
-        spacing: 0;
-        Text {
-            text: label;
-            color: #8b949e;
-            font-size: 12px;
-            vertical-alignment: center;
-            horizontal-stretch: 1;
-        }
-        Text {
-            text: value;
-            color: value-color;
-            font-size: 12px;
-            font-weight: 600;
-            vertical-alignment: center;
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Main window
-// ---------------------------------------------------------------------------
+import { Button, GroupBox, HorizontalBox, ScrollView, VerticalBox } from "std-widgets.slint";
 
 export component MainWindow inherits Window {
-    title: "hoodrat";
-    width: 1280px;
-    height: 800px;
-    background: #0d1117;
+    in property <string> bot_status: "UNKNOWN";
+    in property <string> execution_mode: "disabled";
+    in property <string> portfolio_value: "—";
+    in property <string> buying_power: "—";
+    in property <string> realized_pnl: "—";
+    in property <string> last_run: "No runs recorded";
+    in property <string> last_run_status: "—";
+    in property <string> database_path: "—";
+    in property <string> risk_status: "Not confirmed";
+    in property <string> recent_events: "No agent events recorded.";
+    callback run_now();
+    callback refresh();
+    callback toggle_kill_switch();
 
-    // Bot state
-    in-out property <int> mode-idx: 0;       // 0 = PAPER, 1 = LIVE
-    in-out property <int> account-idx: 0;    // 0 = AGENTIC, 1 = MACHINE
-    in property <string> status-text: "Idle";
-    in property <bool> running: false;
+    min-width: 900px;
+    min-height: 600px;
+    background: #10141c;
 
-    // Portfolio stats
-    in property <string> cash: "$0.00";
-    in property <string> equity-value: "$0.00";
-    in property <string> options-value: "$0.00";
-    in property <string> total-value: "$0.00";
-    in property <string> pnl-text: "+$0.00 (0.00%)";
-    in property <bool> pnl-positive: true;
+    VerticalBox {
+        padding: 24px;
+        spacing: 16px;
 
-    // Data models
-    in property <[TradeEntry]> trades: [];
-    in property <[LogEntry]> log-entries: [];
-    in property <[PositionEntry]> positions: [];
-    in property <string> backtest-result: "";
-
-    in-out property <string> steer-text: "";
-    in property <[TickerEntry]> tickers: [];
-    in-out property <int> backtest-period-idx: 1;  // 0=1D 1=1W 2=1M 3=1Y
-    in-out property <string> custom-ticker-text: "";
-
-    // Chart
-    in property <string> chart-line-path: "";
-    in property <string> chart-area-path: "";
-    in property <bool>   chart-positive: true;
-    in property <string> chart-label: "—";
-    in property <string> chart-high-label: "";
-    in property <string> chart-low-label: "";
-
-    // Token / cost tracking (updated after each Claude invocation)
-    in property <string> usage-runs: "0";
-    in property <string> usage-session-cost: "$0.0000";
-    in property <string> usage-per-run: "$0.0000";
-    in property <string> usage-runs-left: "";     // empty when CLAUDE_BUDGET_USD not set
-    in property <string> usage-tokens: "";
-
-    // Animation triggers (set from Rust)
-    in-out property <bool> tool-active: false;
-    in-out property <bool> trade-flash: false;
-    in-out property <bool> trade-is-buy: true;
-
-    // ── Internal animation state ─────────────────────────────────────────────
-    property <int>   spin-frame:  0;
-    property <bool>  pulse-state: false;
-    property <int>   dot-count:   0;
-    property <float> scan-x:      0.0;
-
-    property <string> spin-char:
-        spin-frame == 0 ? "⠋" : spin-frame == 1 ? "⠙" : spin-frame == 2 ? "⠹" :
-        spin-frame == 3 ? "⠸" : spin-frame == 4 ? "⠼" : spin-frame == 5 ? "⠴" :
-        spin-frame == 6 ? "⠦" : spin-frame == 7 ? "⠧" : spin-frame == 8 ? "⠇" : "⠏";
-
-    property <string> dots-str:
-        dot-count == 1 ? "." : dot-count == 2 ? ".." : dot-count == 3 ? "..." : "";
-
-    // Braille spinner — 10 frames at 80 ms ≈ one rotation per 800 ms
-    Timer { interval: 80ms;  running: root.running; triggered => { spin-frame  = spin-frame  >= 9 ? 0 : spin-frame  + 1; } }
-    // Pulse for the running pill background / text
-    Timer { interval: 700ms; running: root.running; triggered => { pulse-state = !pulse-state; } }
-    // Animated "..." suffix on status text
-    Timer { interval: 400ms; running: root.running; triggered => { dot-count   = dot-count   >= 3 ? 0 : dot-count   + 1; } }
-    // Scan-line sweep across the chart (~5 s per pass at 30 fps)
-    Timer { interval: 33ms;  running: root.running; triggered => {
-        if (scan-x >= 1.0) { scan-x = 0.0; } else { scan-x = scan-x + 0.007; }
-    } }
-    // Auto-clear trade flash after a brief moment
-    Timer { interval: 120ms; running: root.trade-flash; triggered => { root.trade-flash = false; } }
-
-    callback run-once();
-    callback toggle-running();
-    callback steer(string);
-    callback toggle-ticker(string);
-    callback add-ticker(string);
-    callback run-backtest();
-
-    VerticalLayout {
-        spacing: 0;
-        padding: 0;
-
-        // ── Header bar ───────────────────────────────────────────────────────
-        Rectangle {
-            height: 52px;
-            background: #161b22;
-
-            // bottom border
-            Rectangle {
-                y: parent.height - 1px;
-                height: 1px;
-                width: parent.width;
-                background: #30363d;
-            }
-
-            // Shimmer bar — sweeps across the header bottom edge while running
-            if root.running : Rectangle {
-                y: parent.height - 2px;
-                height: 2px;
-                x: root.scan-x * (parent.width - 100px);
-                width: 100px;
-                background: @linear-gradient(90deg, transparent 0%, #3fb950 50%, transparent 100%);
-                opacity: 0.7;
-            }
-
-            HorizontalLayout {
-                padding-left: 16px;
-                padding-right: 16px;
-                padding-top: 0;
-                padding-bottom: 0;
-                spacing: 12px;
-
-                Text {
-                    text: "hoodrat";
-                    color: #58a6ff;
-                    font-size: 20px;
-                    font-weight: 800;
-                    vertical-alignment: center;
-                }
-
-                // Mode selector — segmented control
-                Rectangle {
-                    width: 150px;
-                    height: 26px;
-                    border-radius: 4px;
-                    background: #0d1117;
-                    border-width: 1px;
-                    border-color: #30363d;
-
-                    HorizontalLayout {
-                        padding: 2px;
-                        spacing: 2px;
-
-                        // PAPER
-                        Rectangle {
-                            horizontal-stretch: 1;
-                            border-radius: 3px;
-                            background: root.mode-idx == 0 ? #1f6feb : transparent;
-                            TouchArea {
-                                enabled: !root.running;
-                                clicked => { root.mode-idx = 0; }
-                            }
-                            Text {
-                                x: 0; y: 0;
-                                width: parent.width; height: parent.height;
-                                text: "PAPER";
-                                color: root.mode-idx == 0 ? #ffffff : #484f58;
-                                font-size: 10px; font-weight: 700;
-                                horizontal-alignment: center;
-                                vertical-alignment: center;
-                            }
-                        }
-
-                        // LIVE
-                        Rectangle {
-                            horizontal-stretch: 1;
-                            border-radius: 3px;
-                            background: root.mode-idx == 1 ? #da3633 : transparent;
-                            TouchArea {
-                                enabled: !root.running;
-                                clicked => { root.mode-idx = 1; }
-                            }
-                            Text {
-                                x: 0; y: 0;
-                                width: parent.width; height: parent.height;
-                                text: "LIVE";
-                                color: root.mode-idx == 1 ? #ffffff : #484f58;
-                                font-size: 10px; font-weight: 700;
-                                horizontal-alignment: center;
-                                vertical-alignment: center;
-                            }
-                        }
-                    }
-                }
-
-                // Account selector — AGENTIC | MACHINE
-                // Individual investing account is intentionally absent.
-                Rectangle {
-                    width: 190px;
-                    height: 26px;
-                    border-radius: 4px;
-                    background: #0d1117;
-                    border-width: 1px;
-                    border-color: #30363d;
-
-                    HorizontalLayout {
-                        padding: 2px;
-                        spacing: 2px;
-
-                        Rectangle {
-                            horizontal-stretch: 1;
-                            border-radius: 3px;
-                            background: root.account-idx == 0 ? #162521 : transparent;
-                            TouchArea {
-                                enabled: !root.running;
-                                clicked => { root.account-idx = 0; }
-                            }
-                            Text {
-                                x: 0; y: 0;
-                                width: parent.width; height: parent.height;
-                                text: "AGENTIC";
-                                color: root.account-idx == 0 ? #3fb950 : #484f58;
-                                font-size: 10px; font-weight: 700;
-                                horizontal-alignment: center;
-                                vertical-alignment: center;
-                            }
-                        }
-
-                        Rectangle {
-                            horizontal-stretch: 1;
-                            border-radius: 3px;
-                            background: root.account-idx == 1 ? #1a2740 : transparent;
-                            TouchArea {
-                                enabled: !root.running;
-                                clicked => { root.account-idx = 1; }
-                            }
-                            Text {
-                                x: 0; y: 0;
-                                width: parent.width; height: parent.height;
-                                text: "MACHINE";
-                                color: root.account-idx == 1 ? #79c0ff : #484f58;
-                                font-size: 10px; font-weight: 700;
-                                horizontal-alignment: center;
-                                vertical-alignment: center;
-                            }
-                        }
-                    }
-                }
-
-                // Running indicator — pulses while active
-                Rectangle {
-                    width: 96px;
-                    height: 22px;
-                    border-radius: 4px;
-                    background: running && pulse-state ? #162a1a : #21262d;
-                    animate background { duration: 700ms; easing: ease-in-out; }
-                    Text {
-                        text: running ? (spin-char + " Running") : "○  Idle";
-                        color: running ? (pulse-state ? #56d364 : #3fb950) : #8b949e;
-                        animate color { duration: 700ms; easing: ease-in-out; }
-                        font-size: 11px;
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
-                    }
-                }
-
-                // Status text + animated dots while running
-                Text {
-                    text: running ? (status-text + dots-str) : status-text;
-                    color: #8b949e;
-                    font-size: 12px;
-                    vertical-alignment: center;
-                    horizontal-stretch: 1;
-                    overflow: elide;
-                }
-
-                Button {
-                    text: "Run Once";
-                    enabled: !running;
-                    clicked => { root.run-once(); }
-                }
-                Button {
-                    text: running ? "Stop" : "Start Loop";
-                    clicked => { root.toggle-running(); }
-                }
-            }
-        }
-
-        // ── Steer bar ────────────────────────────────────────────────────────
-        Rectangle {
-            height: 44px;
-            background: #161b22;
-
-            Rectangle { y: 0; height: 1px; width: parent.width; background: #30363d; }
-
-            HorizontalLayout {
-                padding: 8px;
-                spacing: 8px;
-
-                LineEdit {
-                    horizontal-stretch: 1;
-                    placeholder-text: "Steer the bot (queued for next cycle)…";
-                    text <=> root.steer-text;
-                    accepted(text) => { root.steer(text); root.steer-text = ""; }
-                }
-                Button {
-                    text: "Send";
-                    enabled: root.steer-text != "";
-                    clicked => { root.steer(root.steer-text); root.steer-text = ""; }
-                }
-            }
-        }
-
-        // ── Ticker / Backtest bar ────────────────────────────────────────────
-        Rectangle {
-            height: 44px;
-            background: #161b22;
-
-            Rectangle { y: 0; height: 1px; width: parent.width; background: #30363d; }
-
-            HorizontalLayout {
-                padding-left: 10px;
-                padding-right: 10px;
-                padding-top: 0;
-                padding-bottom: 0;
-                spacing: 5px;
-                alignment: center;
-
-                // Ticker chips
-                for t in root.tickers:
-                Rectangle {
-                    width: 52px;
-                    height: 26px;
-                    border-radius: 13px;
-                    background: t.selected ? #1f6feb : transparent;
-                    border-width: 1px;
-                    border-color: t.selected ? #388bfd : #30363d;
-                    TouchArea { clicked => { root.toggle-ticker(t.symbol); } }
-                    Text {
-                        x: 0; y: 0;
-                        width: parent.width; height: parent.height;
-                        text: t.symbol;
-                        color: t.selected ? #ffffff : #8b949e;
-                        font-size: 10px;
-                        font-weight: 700;
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
-                    }
-                }
-
-                // Custom ticker input
-                LineEdit {
-                    width: 72px;
-                    placeholder-text: "Ticker…";
-                    text <=> root.custom-ticker-text;
-                    accepted(text) => {
-                        root.add-ticker(text.to-uppercase());
-                        root.custom-ticker-text = "";
-                    }
-                }
-
-                // Spacer
-                Rectangle { horizontal-stretch: 1; }
-
-                // Backtest label
-                Text {
-                    text: "Backtest:";
-                    color: #8b949e;
-                    font-size: 11px;
-                    vertical-alignment: center;
-                }
-
-                // Period selector
-                Rectangle {
-                    width: 136px;
-                    height: 26px;
-                    border-radius: 4px;
-                    background: #0d1117;
-                    border-width: 1px;
-                    border-color: #30363d;
-
-                    HorizontalLayout {
-                        padding: 2px;
-                        spacing: 2px;
-
-                        Rectangle {
-                            horizontal-stretch: 1;
-                            border-radius: 3px;
-                            background: root.backtest-period-idx == 0 ? #21262d : transparent;
-                            TouchArea { clicked => { root.backtest-period-idx = 0; } }
-                            Text {
-                                x: 0; y: 0; width: parent.width; height: parent.height;
-                                text: "1D"; color: root.backtest-period-idx == 0 ? #c9d1d9 : #484f58;
-                                font-size: 10px; font-weight: 700;
-                                horizontal-alignment: center; vertical-alignment: center;
-                            }
-                        }
-                        Rectangle {
-                            horizontal-stretch: 1;
-                            border-radius: 3px;
-                            background: root.backtest-period-idx == 1 ? #21262d : transparent;
-                            TouchArea { clicked => { root.backtest-period-idx = 1; } }
-                            Text {
-                                x: 0; y: 0; width: parent.width; height: parent.height;
-                                text: "1W"; color: root.backtest-period-idx == 1 ? #c9d1d9 : #484f58;
-                                font-size: 10px; font-weight: 700;
-                                horizontal-alignment: center; vertical-alignment: center;
-                            }
-                        }
-                        Rectangle {
-                            horizontal-stretch: 1;
-                            border-radius: 3px;
-                            background: root.backtest-period-idx == 2 ? #21262d : transparent;
-                            TouchArea { clicked => { root.backtest-period-idx = 2; } }
-                            Text {
-                                x: 0; y: 0; width: parent.width; height: parent.height;
-                                text: "1M"; color: root.backtest-period-idx == 2 ? #c9d1d9 : #484f58;
-                                font-size: 10px; font-weight: 700;
-                                horizontal-alignment: center; vertical-alignment: center;
-                            }
-                        }
-                        Rectangle {
-                            horizontal-stretch: 1;
-                            border-radius: 3px;
-                            background: root.backtest-period-idx == 3 ? #21262d : transparent;
-                            TouchArea { clicked => { root.backtest-period-idx = 3; } }
-                            Text {
-                                x: 0; y: 0; width: parent.width; height: parent.height;
-                                text: "1Y"; color: root.backtest-period-idx == 3 ? #c9d1d9 : #484f58;
-                                font-size: 10px; font-weight: 700;
-                                horizontal-alignment: center; vertical-alignment: center;
-                            }
-                        }
-                    }
-                }
-
-                Button {
-                    text: "Backtest";
-                    clicked => { root.run-backtest(); }
-                }
-            }
-        }
-
-        // ── P&L Chart ────────────────────────────────────────────────────────
-        Rectangle {
-            height: 110px;
-            background: #070b0f;
-
-            Rectangle { y: 0; height: 1px; width: parent.width; background: #21262d; }
-
-            // Y-axis labels
+        HorizontalBox {
+            spacing: 16px;
             Text {
-                x: 4px; y: 4px;
-                text: root.chart-high-label;
-                color: #484f58; font-size: 9px;
-            }
-            Text {
-                x: 4px; y: parent.height - 14px;
-                text: root.chart-low-label;
-                color: #484f58; font-size: 9px;
-            }
-
-            // Filled area under the line (semi-transparent)
-            Path {
-                x: 36px; y: 4px;
-                width: parent.width - 120px;
-                height: parent.height - 8px;
-                fill: root.chart-positive ? #1a3a22 : #3a1a1a;
-                stroke: transparent;
-                stroke-width: 0;
-                viewbox-width: 1000;
-                viewbox-height: 100;
-                commands: root.chart-area-path;
-            }
-
-            // Line on top
-            Path {
-                x: 36px; y: 4px;
-                width: parent.width - 120px;
-                height: parent.height - 8px;
-                fill: transparent;
-                stroke: root.chart-positive ? #3fb950 : #f85149;
-                stroke-width: 1.5px;
-                viewbox-width: 1000;
-                viewbox-height: 100;
-                commands: root.chart-line-path;
-            }
-
-            // Scan line — sweeps across the chart while running
-            if root.running : Rectangle {
-                x: 36px + root.scan-x * (parent.width - 120px);
-                y: 0;
-                width: 1px;
-                height: parent.height;
-                background: root.chart-positive ? #3fb950 : #f85149;
-                opacity: 0.45;
-            }
-
-            // Current value + delta label
-            Text {
-                x: parent.width - 114px;
-                y: 0;
-                width: 110px;
-                height: parent.height;
-                text: root.chart-label;
-                color: root.chart-positive ? #3fb950 : #f85149;
-                font-size: 11px;
+                text: "HOODRAT";
+                color: #f3f4f6;
+                font-size: 30px;
                 font-weight: 700;
-                horizontal-alignment: right;
+            }
+            Text {
+                text: "agentic trading supervisor";
+                color: #9ca3af;
                 vertical-alignment: center;
-                wrap: word-wrap;
+                font-size: 15px;
+            }
+            Rectangle { horizontal-stretch: 1; }
+            Button { text: "Refresh"; clicked => { root.refresh(); } }
+            Button { text: "Run evaluation"; clicked => { root.run_now(); } }
+            Button { text: "Toggle kill switch"; clicked => { root.toggle_kill_switch(); } }
+        }
+
+        HorizontalBox {
+            spacing: 12px;
+            GroupBox {
+                title: "Bot";
+                HorizontalBox {
+                    padding: 12px;
+                    spacing: 12px;
+                    Text { text: root.bot_status; color: #86efac; font-size: 18px; }
+                    Text { text: root.execution_mode; color: #d1d5db; vertical-alignment: center; }
+                }
+            }
+            GroupBox {
+                title: "Risk policy";
+                HorizontalBox {
+                    padding: 12px;
+                    Text { text: root.risk_status; color: #fbbf24; font-size: 16px; }
+                }
+            }
+            GroupBox {
+                title: "Last run";
+                HorizontalBox {
+                    padding: 12px;
+                    spacing: 8px;
+                    Text { text: root.last_run; color: #d1d5db; }
+                    Text { text: root.last_run_status; color: #93c5fd; }
+                }
             }
         }
 
-        // ── Body ─────────────────────────────────────────────────────────────
-        HorizontalLayout {
-            vertical-stretch: 1;
-            spacing: 0;
-            padding: 0;
+        HorizontalBox {
+            spacing: 12px;
+            GroupBox {
+                title: "Portfolio value";
+                VerticalBox { padding: 16px; Text { text: root.portfolio_value; color: #f3f4f6; font-size: 26px; } }
+            }
+            GroupBox {
+                title: "Buying power";
+                VerticalBox { padding: 16px; Text { text: root.buying_power; color: #f3f4f6; font-size: 26px; } }
+            }
+            GroupBox {
+                title: "Realized PnL";
+                VerticalBox { padding: 16px; Text { text: root.realized_pnl; color: #86efac; font-size: 26px; } }
+            }
+        }
 
-            // ── Portfolio panel ───────────────────────────────────────────────
-            Rectangle {
-                width: 248px;
-                background: #0d1117;
-
-                // right border
-                Rectangle {
-                    x: parent.width - 1px;
-                    width: 1px;
-                    height: parent.height;
-                    background: #21262d;
-                }
-
-                VerticalLayout {
-                    padding: 16px;
-                    spacing: 4px;
-                    alignment: start;
-
+        GroupBox {
+            title: "Recent agent events";
+            VerticalBox {
+                padding: 12px;
+                ScrollView {
+                    viewport-height: 180px;
                     Text {
-                        text: "Portfolio";
-                        color: #f0f6fc;
+                        text: root.recent_events;
+                        color: #d1d5db;
                         font-size: 13px;
-                        font-weight: 700;
-                    }
-
-                    Rectangle { height: 1px; background: #21262d; }
-
-                    StatRow { label: "Cash"; value: cash; }
-                    StatRow { label: "Equity"; value: equity-value; }
-                    StatRow { label: "Options"; value: options-value; }
-
-                    Rectangle { height: 1px; background: #21262d; }
-
-                    StatRow { label: "Total"; value: total-value; value-color: #f0f6fc; }
-                    StatRow {
-                        label: "P&L";
-                        value: pnl-text;
-                        value-color: pnl-positive ? #3fb950 : #f85149;
-                    }
-
-                    // ── Backtest result banner ────────────────────────────────
-                    if root.backtest-result != "" : Rectangle {
-                        border-radius: 4px;
-                        background: #1a2740;
-                        VerticalLayout {
-                            padding: 8px;
-                            spacing: 3px;
-                            Text {
-                                text: "BACKTEST RESULT";
-                                color: #79c0ff;
-                                font-size: 9px;
-                                font-weight: 700;
-                            }
-                            Text {
-                                text: root.backtest-result;
-                                color: #c9d1d9;
-                                font-size: 11px;
-                                wrap: word-wrap;
-                            }
-                        }
-                    }
-
-                    // ── Open positions ────────────────────────────────────────
-                    if root.positions.length > 0 : Rectangle {
-                        height: 1px;
-                        background: #21262d;
-                    }
-
-                    if root.positions.length > 0 : Text {
-                        text: "Open Positions";
-                        color: #8b949e;
-                        font-size: 11px;
-                        font-weight: 600;
-                    }
-
-                    for p in root.positions : HorizontalLayout {
-                        spacing: 4px;
-                        padding-top: 2px;
-                        padding-bottom: 2px;
-
-                        Text {
-                            text: p.detail != "" ? p.symbol + " " + p.detail : p.symbol;
-                            color: #c9d1d9;
-                            font-size: 11px;
-                            horizontal-stretch: 1;
-                            vertical-alignment: center;
-                            overflow: elide;
-                        }
-                        Text {
-                            text: p.qty;
-                            color: #8b949e;
-                            font-size: 10px;
-                            width: 28px;
-                            vertical-alignment: center;
-                        }
-                        Text {
-                            text: p.pnl;
-                            color: p.is-gain ? #3fb950 : #f85149;
-                            font-size: 11px;
-                            font-weight: 600;
-                            vertical-alignment: center;
-                        }
-                    }
-
-                    // ── Usage / cost tracking ─────────────────────────────────
-                    if root.usage-runs != "0" : Rectangle {
-                        height: 1px;
-                        background: #21262d;
-                    }
-                    if root.usage-runs != "0" : Text {
-                        text: "Usage";
-                        color: #8b949e;
-                        font-size: 11px;
-                        font-weight: 600;
-                    }
-                    if root.usage-runs != "0" : StatRow {
-                        label: "Runs";
-                        value: root.usage-runs;
-                    }
-                    if root.usage-runs != "0" : StatRow {
-                        label: "Session";
-                        value: root.usage-session-cost;
-                    }
-                    if root.usage-runs != "0" : StatRow {
-                        label: "Per run";
-                        value: root.usage-per-run;
-                    }
-                    if root.usage-tokens != "" : StatRow {
-                        label: "Tokens";
-                        value: root.usage-tokens;
-                        value-color: #8b949e;
-                    }
-                    if root.usage-runs-left != "" : StatRow {
-                        label: "Est. left";
-                        value: root.usage-runs-left + " runs";
-                        value-color: #79c0ff;
+                        wrap: word-wrap;
                     }
                 }
             }
+        }
 
-            // ── Trades panel ─────────────────────────────────────────────────
-            Rectangle {
-                width: 360px;
-                background: #0d1117;
-
-                // right border
-                Rectangle {
-                    x: parent.width - 1px;
-                    width: 1px;
-                    height: parent.height;
-                    background: #21262d;
-                }
-
-                // Trade fill flash — fades in on new trade, decays over ~800 ms
-                Rectangle {
-                    x: 0; y: 0;
-                    width: parent.width;
-                    height: parent.height;
-                    background: root.trade-is-buy ? #3fb950 : #f85149;
-                    opacity: root.trade-flash ? 0.10 : 0.0;
-                    animate opacity { duration: 800ms; easing: ease-out; }
-                }
-
-                VerticalLayout {
-                    padding-top: 16px;
-                    padding-left: 0;
-                    padding-right: 0;
-                    padding-bottom: 0;
-                    spacing: 0;
-
-                    // Panel title
-                    HorizontalLayout {
-                        padding-left: 16px;
-                        padding-right: 16px;
-                        padding-bottom: 10px;
-                        Text {
-                            text: "Trades";
-                            color: #f0f6fc;
-                            font-size: 13px;
-                            font-weight: 700;
-                            horizontal-stretch: 1;
-                        }
-                        Text {
-                            text: trades.length > 0 ? trades.length + " filled" : "";
-                            color: #8b949e;
-                            font-size: 11px;
-                            vertical-alignment: center;
-                        }
-                    }
-
-                    // Column headers
-                    Rectangle {
-                        height: 28px;
-                        background: #161b22;
-
-                        Rectangle {
-                            y: parent.height - 1px;
-                            height: 1px;
-                            width: parent.width;
-                            background: #21262d;
-                        }
-
-                        HorizontalLayout {
-                            padding-left: 12px;
-                            padding-right: 12px;
-                            spacing: 0;
-
-                            Text { text: "Side";   color: #8b949e; font-size: 11px; font-weight: 600; width: 44px;  vertical-alignment: center; }
-                            Text { text: "Symbol"; color: #8b949e; font-size: 11px; font-weight: 600; width: 72px;  vertical-alignment: center; }
-                            Text { text: "Qty";    color: #8b949e; font-size: 11px; font-weight: 600; width: 44px;  vertical-alignment: center; }
-                            Text { text: "Price";  color: #8b949e; font-size: 11px; font-weight: 600; width: 72px;  vertical-alignment: center; }
-                            Text { text: "Total";  color: #8b949e; font-size: 11px; font-weight: 600; horizontal-stretch: 1; vertical-alignment: center; }
-                        }
-                    }
-
-                    // Trade rows
-                    ListView {
-                        vertical-stretch: 1;
-                        for t in trades:
-                        Rectangle {
-                            height: 34px;
-                            background: transparent;
-
-                            // row separator
-                            Rectangle {
-                                y: parent.height - 1px;
-                                height: 1px;
-                                width: parent.width;
-                                background: #161b22;
-                            }
-
-                            HorizontalLayout {
-                                padding-left: 12px;
-                                padding-right: 12px;
-                                spacing: 0;
-                                alignment: center;
-
-                                Text { text: t.side;     color: t.is-buy ? #3fb950 : #f85149; font-size: 12px; font-weight: 700; width: 44px; vertical-alignment: center; }
-                                Text { text: t.symbol;   color: #c9d1d9; font-size: 12px; width: 72px;  vertical-alignment: center; }
-                                Text { text: t.quantity; color: #c9d1d9; font-size: 12px; width: 44px;  vertical-alignment: center; }
-                                Text { text: t.price;    color: #c9d1d9; font-size: 12px; width: 72px;  vertical-alignment: center; }
-                                Text { text: t.total;    color: #c9d1d9; font-size: 12px; horizontal-stretch: 1; vertical-alignment: center; overflow: elide; }
-                            }
-                        }
-                    }
-
-                    if trades.length == 0 : Rectangle {
-                        height: 80px;
-                        Text {
-                            text: "No trades yet";
-                            color: #484f58;
-                            font-size: 12px;
-                            horizontal-alignment: center;
-                            vertical-alignment: center;
-                        }
-                    }
-                }
-            }
-
-            // ── Analysis log ─────────────────────────────────────────────────
-            Rectangle {
-                horizontal-stretch: 1;
-                background: #0d1117;
-
-                VerticalLayout {
-                    padding-top: 16px;
-                    padding-left: 0;
-                    padding-right: 0;
-                    padding-bottom: 0;
-                    spacing: 0;
-
-                    HorizontalLayout {
-                        padding-left: 16px;
-                        padding-right: 16px;
-                        padding-bottom: 10px;
-                        Text {
-                            text: "Analysis Log";
-                            color: #f0f6fc;
-                            font-size: 13px;
-                            font-weight: 700;
-                        }
-                        Text {
-                            text: "  newest first";
-                            color: #484f58;
-                            font-size: 11px;
-                            vertical-alignment: center;
-                            horizontal-stretch: 1;
-                        }
-                    }
-
-                    Rectangle {
-                        height: 2px;
-                        background: root.tool-active ? #388bfd : #21262d;
-                        animate background { duration: 200ms; easing: ease-out; }
-                    }
-
-                    ListView {
-                        vertical-stretch: 1;
-                        for entry in log-entries:
-                        Rectangle {
-                            // Height is content-driven: text natural height + padding.
-                            // min-height keeps one-liners from being too cramped.
-                            height: max(36px, entry-txt.preferred-height + 16px);
-                            background: entry.kind == "error"    ? #2d1117 :
-                                        entry.kind == "analysis" ? #0d1f2d : transparent;
-
-                            // separator
-                            Rectangle {
-                                y: parent.height - 1px;
-                                height: 1px;
-                                width: parent.width;
-                                background: #161b22;
-                            }
-
-                            // kind tag
-                            Rectangle {
-                                x: 0; y: 0;
-                                width: 3px;
-                                height: parent.height;
-                                background: entry.kind == "analysis" ? #58a6ff :
-                                            entry.kind == "tool"     ? #79c0ff :
-                                            entry.kind == "result"   ? #3fb950 :
-                                            entry.kind == "error"    ? #f85149 : #30363d;
-                            }
-
-                            entry-txt := TextInput {
-                                x: 12px;
-                                y: 8px;
-                                width: parent.width - 24px;
-                                text: entry.text;
-                                color: entry.kind == "analysis" ? #c9d1d9 :
-                                       entry.kind == "tool"     ? #79c0ff :
-                                       entry.kind == "result"   ? #56d364 :
-                                       entry.kind == "error"    ? #f85149 : #8b949e;
-                                font-size: 11px;
-                                wrap: word-wrap;
-                                read-only: true;
-                                single-line: false;
-                                selection-background-color: #1f6feb;
-                                selection-foreground-color: #ffffff;
-                            }
-                        }
-                    }
-
-                    if log-entries.length == 0 : Rectangle {
-                        height: 80px;
-                        Text {
-                            text: "Waiting for bot activity...";
-                            color: #484f58;
-                            font-size: 12px;
-                            horizontal-alignment: center;
-                            vertical-alignment: center;
-                        }
-                    }
-                }
-            }
+        Rectangle { vertical-stretch: 1; }
+        Text {
+            text: "State: " + root.database_path + "   |   Direct MCP mode: Rust auditing is not a pre-trade firewall.";
+            color: #6b7280;
+            font-size: 12px;
         }
     }
 }
