@@ -1,14 +1,19 @@
-use crate::ingestion::{BrokerDataSink, ExecutionRecord, PortfolioSnapshot};
+use crate::ingestion::{
+    parse_broker_payload, AccountRecord, BalanceRecord, BrokerDataSink, BrokerPayload,
+    ExecutionRecord, PnlSnapshot, PnlTradeRecord, PortfolioSnapshot, PositionRecord,
+};
 use anyhow::{Context, Result};
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::path::Path;
 
 const INITIAL_MIGRATION: &str = include_str!("../migrations/001_initial.sql");
 const TOOL_EVENTS_MIGRATION: &str = include_str!("../migrations/002_tool_events.sql");
 const SCHEMA_METADATA_MIGRATION: &str = include_str!("../migrations/003_schema_metadata.sql");
+const TYPED_BROKER_MIGRATION: &str = include_str!("../migrations/004_typed_broker_ingestion.sql");
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RunRecord {
@@ -55,6 +60,16 @@ pub struct DashboardSnapshot {
     pub realized_pnl: Option<f64>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ReconciliationReport {
+    pub status: String,
+    pub account_count: u32,
+    pub balance_count: u32,
+    pub position_count: u32,
+    pub pnl_trade_count: u32,
+    pub drift: Vec<String>,
+}
+
 pub struct Store {
     connection: Connection,
 }
@@ -72,6 +87,38 @@ impl Store {
         connection.execute_batch(INITIAL_MIGRATION)?;
         connection.execute_batch(TOOL_EVENTS_MIGRATION)?;
         connection.execute_batch(SCHEMA_METADATA_MIGRATION)?;
+        connection.execute_batch(TYPED_BROKER_MIGRATION)?;
+        ensure_column(
+            &connection,
+            "broker_pnl_snapshots",
+            "total_returns_usd",
+            "REAL",
+        )?;
+        ensure_column(
+            &connection,
+            "broker_pnl_snapshots",
+            "rate_of_realized_gain",
+            "REAL",
+        )?;
+        ensure_column(
+            &connection,
+            "broker_pnl_snapshots",
+            "total_rate_of_return",
+            "REAL",
+        )?;
+        ensure_column(
+            &connection,
+            "broker_pnl_snapshots",
+            "number_of_trades",
+            "INTEGER",
+        )?;
+        ensure_column(&connection, "broker_accounts", "rhc_account_number", "TEXT")?;
+        ensure_column(
+            &connection,
+            "broker_balances",
+            "unleveraged_buying_power_usd",
+            "REAL",
+        )?;
         Ok(Self { connection })
     }
 
@@ -142,6 +189,139 @@ impl Store {
         Ok(())
     }
 
+    pub fn ingest_typed_broker_payload(
+        &self,
+        tool_name: &str,
+        raw: &Value,
+    ) -> Result<BrokerPayload> {
+        let payload = parse_broker_payload(tool_name, raw)?;
+        match &payload {
+            BrokerPayload::Accounts(accounts) => {
+                for account in accounts {
+                    self.insert_account(account)?;
+                }
+            }
+            BrokerPayload::Portfolio {
+                snapshot,
+                balances,
+                positions,
+            } => {
+                self.insert_portfolio_snapshot(snapshot)?;
+                for balance in balances {
+                    self.insert_balance(balance)?;
+                }
+                for position in positions {
+                    self.insert_position(position)?;
+                }
+            }
+            BrokerPayload::Pnl(snapshot) => self.insert_pnl_snapshot(snapshot)?,
+            BrokerPayload::PnlTradeHistory(trades) => {
+                for trade in trades {
+                    self.insert_pnl_trade(trade)?;
+                }
+            }
+        }
+        Ok(payload)
+    }
+
+    pub fn finalize_reconciliation(
+        &self,
+        raw_payloads: &BTreeMap<String, Value>,
+    ) -> Result<ReconciliationReport> {
+        let mut accounts = Vec::new();
+        let mut balances = Vec::new();
+        let mut positions = Vec::new();
+        let mut pnl_snapshots = Vec::new();
+        let mut pnl_trades = Vec::new();
+        for (tool_name, raw) in raw_payloads {
+            match parse_broker_payload(tool_name, raw)? {
+                BrokerPayload::Accounts(values) => accounts.extend(values),
+                BrokerPayload::Portfolio {
+                    balances: values,
+                    positions: position_values,
+                    ..
+                } => {
+                    balances.extend(values);
+                    positions.extend(position_values);
+                }
+                BrokerPayload::Pnl(value) => pnl_snapshots.push(value),
+                BrokerPayload::PnlTradeHistory(values) => pnl_trades.extend(values),
+            }
+        }
+        let fingerprint = fingerprint_json(
+            &accounts,
+            &balances,
+            &positions,
+            &pnl_snapshots,
+            &pnl_trades,
+        );
+        let previous = self
+            .connection
+            .query_row(
+                "SELECT fingerprint_json FROM reconciliation_runs WHERE status = 'baseline' OR status = 'reconciled' ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let drift = previous
+            .as_deref()
+            .filter(|old| *old != fingerprint)
+            .map(|_| vec!["account, balance, position, or PnL trade state changed since the last successful reconciliation".to_owned()])
+            .unwrap_or_default();
+        let status = if previous.is_none() {
+            "baseline"
+        } else if drift.is_empty() {
+            "reconciled"
+        } else {
+            "drift_detected"
+        };
+        let report = ReconciliationReport {
+            status: status.to_owned(),
+            account_count: accounts.len() as u32,
+            balance_count: balances.len() as u32,
+            position_count: positions.len() as u32,
+            pnl_trade_count: pnl_trades.len() as u32,
+            drift,
+        };
+        self.connection.execute(
+            "INSERT INTO reconciliation_runs (captured_at, status, account_count, balance_count, position_count, pnl_trade_count, drift_json, raw_json, fingerprint_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                now(),
+                report.status,
+                report.account_count,
+                report.balance_count,
+                report.position_count,
+                report.pnl_trade_count,
+                serde_json::to_string(&report.drift)?,
+                serde_json::to_string(raw_payloads)?,
+                fingerprint,
+            ],
+        )?;
+        Ok(report)
+    }
+
+    #[allow(dead_code)]
+    pub fn latest_reconciliation(&self) -> Result<Option<ReconciliationReport>> {
+        self.connection
+            .query_row(
+                "SELECT status, account_count, balance_count, position_count, pnl_trade_count, drift_json FROM reconciliation_runs ORDER BY id DESC LIMIT 1",
+                [],
+                |row| {
+                    let drift_json: String = row.get(5)?;
+                    Ok(ReconciliationReport {
+                        status: row.get(0)?,
+                        account_count: row.get(1)?,
+                        balance_count: row.get(2)?,
+                        position_count: row.get(3)?,
+                        pnl_trade_count: row.get(4)?,
+                        drift: serde_json::from_str(&drift_json).unwrap_or_default(),
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     #[allow(dead_code)]
     pub fn record_portfolio_snapshot(&self, raw: &Value) -> Result<()> {
         let snapshot = PortfolioSnapshot::from_value(raw)?;
@@ -158,6 +338,114 @@ impl Store {
                 snapshot.realized_pnl_usd,
                 snapshot.unrealized_pnl_usd,
                 serde_json::to_string(&snapshot.raw)?,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn insert_account(&self, account: &AccountRecord) -> Result<()> {
+        self.connection.execute(
+            "INSERT OR IGNORE INTO broker_accounts (captured_at, account_number, rhs_account_number, rhc_account_number, account_type, brokerage_account_type, nickname, is_default, agentic_allowed, option_level, management_type, affiliate, state, deactivated, permanently_deactivated, raw_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+            params![
+                account.captured_at,
+                account.account_number,
+                account.rhs_account_number,
+                account.rhc_account_number,
+                account.account_type,
+                account.brokerage_account_type,
+                account.nickname,
+                account.is_default,
+                account.agentic_allowed,
+                account.option_level,
+                account.management_type,
+                account.affiliate,
+                account.state,
+                account.deactivated,
+                account.permanently_deactivated,
+                serde_json::to_string(&account.raw)?,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn insert_balance(&self, balance: &BalanceRecord) -> Result<()> {
+        self.connection.execute(
+            "INSERT INTO broker_balances (captured_at, account_number, cash_usd, buying_power_usd, unleveraged_buying_power_usd, equity_usd, margin_used_usd, unsettled_funds_usd, raw_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                balance.captured_at,
+                balance.account_number,
+                balance.cash_usd,
+                balance.buying_power_usd,
+                balance.unleveraged_buying_power_usd,
+                balance.equity_usd,
+                balance.margin_used_usd,
+                balance.unsettled_funds_usd,
+                serde_json::to_string(&balance.raw)?,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn insert_position(&self, position: &PositionRecord) -> Result<()> {
+        self.connection.execute(
+            "INSERT INTO broker_positions (captured_at, account_number, symbol, instrument_id, asset_class, quantity, average_cost_usd, market_value_usd, current_price_usd, unrealized_pnl_usd, raw_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                position.captured_at,
+                position.account_number,
+                position.symbol,
+                position.instrument_id,
+                position.asset_class,
+                position.quantity,
+                position.average_cost_usd,
+                position.market_value_usd,
+                position.current_price_usd,
+                position.unrealized_pnl_usd,
+                serde_json::to_string(&position.raw)?,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn insert_pnl_snapshot(&self, snapshot: &PnlSnapshot) -> Result<()> {
+        self.connection.execute(
+            "INSERT INTO broker_pnl_snapshots (captured_at, account_number, span, start_date, end_date, realized_pnl_usd, total_returns_usd, rate_of_realized_gain, total_rate_of_return, number_of_trades, by_asset_class_json, raw_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                snapshot.captured_at,
+                snapshot.account_number,
+                snapshot.span,
+                snapshot.start_date,
+                snapshot.end_date,
+                snapshot.realized_pnl_usd,
+                snapshot.total_returns_usd,
+                snapshot.rate_of_realized_gain,
+                snapshot.total_rate_of_return,
+                snapshot.number_of_trades,
+                snapshot
+                    .by_asset_class
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()?,
+                serde_json::to_string(&snapshot.raw)?,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn insert_pnl_trade(&self, trade: &PnlTradeRecord) -> Result<()> {
+        self.connection.execute(
+            "INSERT INTO broker_pnl_trades (captured_at, account_number, external_id, symbol, asset_class, side, quantity, realized_pnl_usd, opened_at, closed_at, raw_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                trade.captured_at,
+                trade.account_number,
+                trade.external_id,
+                trade.symbol,
+                trade.asset_class,
+                trade.side,
+                trade.quantity,
+                trade.realized_pnl_usd,
+                trade.opened_at,
+                trade.closed_at,
+                serde_json::to_string(&trade.raw)?,
             ],
         )?;
         Ok(())
@@ -346,7 +634,29 @@ fn now() -> String {
     Utc::now().to_rfc3339()
 }
 
+fn ensure_column(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+    column_type: &str,
+) -> Result<()> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+    let present = columns
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .iter()
+        .any(|name| name == column);
+    if !present {
+        connection.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {column_type}"),
+            [],
+        )?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
 
@@ -357,7 +667,7 @@ mod tests {
             .record_audit(None, "test", "created", &serde_json::json!({"ok": true}))
             .unwrap();
         assert!(store.latest_run().unwrap().is_none());
-        assert_eq!(store.schema_version().unwrap(), 3);
+        assert_eq!(store.schema_version().unwrap(), 4);
     }
 
     #[test]
@@ -423,4 +733,156 @@ mod tests {
         assert_eq!(store.portfolio_snapshot_count().unwrap(), 1);
         assert_eq!(store.execution_count().unwrap(), 1);
     }
+
+    #[test]
+    fn ingests_typed_payloads_and_establishes_then_checks_baseline() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let mut payloads = BTreeMap::new();
+        for (tool, fixture) in [
+            (
+                "get_accounts",
+                include_str!("../tests/fixtures/get_accounts.json"),
+            ),
+            (
+                "get_portfolio",
+                include_str!("../tests/fixtures/get_portfolio.json"),
+            ),
+            (
+                "get_realized_pnl",
+                include_str!("../tests/fixtures/get_realized_pnl.json"),
+            ),
+            (
+                "get_pnl_trade_history",
+                include_str!("../tests/fixtures/get_pnl_trade_history.json"),
+            ),
+        ] {
+            let raw: Value = serde_json::from_str(fixture).unwrap();
+            store.ingest_typed_broker_payload(tool, &raw).unwrap();
+            payloads.insert(tool.to_owned(), raw);
+        }
+        let first = store.finalize_reconciliation(&payloads).unwrap();
+        assert_eq!(first.status, "baseline");
+        assert_eq!(first.account_count, 2);
+        assert_eq!(first.position_count, 1);
+        assert_eq!(first.pnl_trade_count, 1);
+        let second = store.finalize_reconciliation(&payloads).unwrap();
+        assert_eq!(second.status, "reconciled");
+        assert!(store.latest_reconciliation().unwrap().is_some());
+
+        let mut changed = payloads.clone();
+        changed.insert(
+            "get_portfolio".to_owned(),
+            serde_json::json!({
+                "structuredContent": {"data": {"total_value": "1300.50", "buying_power": "50"}}
+            }),
+        );
+        let drift = store.finalize_reconciliation(&changed).unwrap();
+        assert_eq!(drift.status, "drift_detected");
+        assert_eq!(drift.drift.len(), 1);
+    }
+}
+
+fn fingerprint_json(
+    accounts: &[AccountRecord],
+    balances: &[BalanceRecord],
+    positions: &[PositionRecord],
+    pnl_snapshots: &[PnlSnapshot],
+    pnl_trades: &[PnlTradeRecord],
+) -> String {
+    let mut account_values = accounts
+        .iter()
+        .map(|account| {
+            serde_json::json!({
+                "account_number": account.account_number,
+                "rhs_account_number": account.rhs_account_number,
+                "rhc_account_number": account.rhc_account_number,
+                "account_type": account.account_type,
+                "brokerage_account_type": account.brokerage_account_type,
+                "is_default": account.is_default,
+                "agentic_allowed": account.agentic_allowed,
+                "option_level": account.option_level,
+                "management_type": account.management_type,
+                "affiliate": account.affiliate,
+                "state": account.state,
+                "deactivated": account.deactivated,
+                "permanently_deactivated": account.permanently_deactivated,
+            })
+        })
+        .collect::<Vec<_>>();
+    account_values.sort_by_key(|value| value.to_string());
+    let mut balance_values = balances
+        .iter()
+        .map(|balance| {
+            serde_json::json!({
+                "account_number": balance.account_number,
+                "cash_usd": balance.cash_usd,
+                "buying_power_usd": balance.buying_power_usd,
+                "unleveraged_buying_power_usd": balance.unleveraged_buying_power_usd,
+                "equity_usd": balance.equity_usd,
+                "margin_used_usd": balance.margin_used_usd,
+                "unsettled_funds_usd": balance.unsettled_funds_usd,
+            })
+        })
+        .collect::<Vec<_>>();
+    balance_values.sort_by_key(|value| value.to_string());
+    let mut position_values = positions
+        .iter()
+        .map(|position| {
+            serde_json::json!({
+                "account_number": position.account_number,
+                "symbol": position.symbol,
+                "instrument_id": position.instrument_id,
+                "asset_class": position.asset_class,
+                "quantity": position.quantity,
+                "average_cost_usd": position.average_cost_usd,
+                "market_value_usd": position.market_value_usd,
+                "current_price_usd": position.current_price_usd,
+                "unrealized_pnl_usd": position.unrealized_pnl_usd,
+            })
+        })
+        .collect::<Vec<_>>();
+    position_values.sort_by_key(|value| value.to_string());
+    let mut pnl_snapshot_values = pnl_snapshots
+        .iter()
+        .map(|snapshot| {
+            serde_json::json!({
+                "account_number": snapshot.account_number,
+                "span": snapshot.span,
+                "start_date": snapshot.start_date,
+                "end_date": snapshot.end_date,
+                "realized_pnl_usd": snapshot.realized_pnl_usd,
+                "total_returns_usd": snapshot.total_returns_usd,
+                "rate_of_realized_gain": snapshot.rate_of_realized_gain,
+                "total_rate_of_return": snapshot.total_rate_of_return,
+                "number_of_trades": snapshot.number_of_trades,
+                "by_asset_class": snapshot.by_asset_class,
+            })
+        })
+        .collect::<Vec<_>>();
+    pnl_snapshot_values.sort_by_key(|value| value.to_string());
+    let mut pnl_values = pnl_trades
+        .iter()
+        .map(|trade| {
+            serde_json::json!({
+                "account_number": trade.account_number,
+                "external_id": trade.external_id,
+                "symbol": trade.symbol,
+                "asset_class": trade.asset_class,
+                "side": trade.side,
+                "quantity": trade.quantity,
+                "realized_pnl_usd": trade.realized_pnl_usd,
+                "opened_at": trade.opened_at,
+                "closed_at": trade.closed_at,
+            })
+        })
+        .collect::<Vec<_>>();
+    pnl_values.sort_by_key(|value| value.to_string());
+    serde_json::json!({
+        "accounts": account_values,
+        "balances": balance_values,
+        "positions": position_values,
+        "pnl_snapshots": pnl_snapshot_values,
+        "pnl_trades": pnl_values,
+    })
+    .to_string()
 }

@@ -5,7 +5,7 @@ mod readiness;
 mod scheduler;
 mod store;
 
-use agent::{run_executable_version, run_read_only_smoke_test};
+use agent::{run_executable_version, run_read_only_reconciliation, run_read_only_smoke_test};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use config::{default_config_path, Config};
@@ -38,6 +38,8 @@ enum CommandKind {
     Doctor,
     /// Run a read-only Cline/Robinhood MCP connectivity test.
     SmokeTest,
+    /// Run the four-tool read-only account/portfolio reconciliation.
+    Reconcile,
     /// Run scheduled agent evaluations.
     Run {
         /// Evaluate each enabled lane once instead of running continuously.
@@ -54,6 +56,7 @@ fn main() -> Result<()> {
         CommandKind::Init => initialize(&cli.config),
         CommandKind::Doctor => doctor(&cli.config),
         CommandKind::SmokeTest => smoke_test(&cli.config),
+        CommandKind::Reconcile => reconcile(&cli.config),
         CommandKind::Run { once } => run(cli.config, once),
         CommandKind::Dashboard => dashboard(cli.config),
     }
@@ -250,6 +253,77 @@ fn smoke_test(config_path: &Path) -> Result<()> {
         anyhow::bail!(
             "Robinhood MCP was not verified: no successful read tool call targeted the configured server"
         );
+    }
+    Ok(())
+}
+
+fn reconcile(config_path: &Path) -> Result<()> {
+    let (config, store) = load_runtime(config_path)?;
+
+    if config.execution.mode != config::ExecutionMode::Disabled {
+        anyhow::bail!("reconcile requires execution.mode=disabled");
+    }
+    if !config.execution.kill_switch_engaged {
+        anyhow::bail!("reconcile requires the kill switch to remain engaged");
+    }
+    if config.risk.confirmed {
+        anyhow::bail!("reconcile requires risk.confirmed=false");
+    }
+    if !config.robinhood.agentic_account_only {
+        anyhow::bail!("reconcile requires robinhood.agentic_account_only=true");
+    }
+
+    println!("starting read-only account reconciliation");
+    println!("safety mode: plan=true, auto_approve=true, retries=1, thinking=none");
+    let result = run_read_only_reconciliation(
+        &config.agent,
+        &store,
+        &config.robinhood.mcp_server_name,
+        &agent::ProcessAgentExecutor,
+    )?;
+    println!(
+        "reconciliation run {} finished with exit={:?}, events={}, tool_events={}, robinhood_reads={}, mcp_errors={}, unexpected_tools={}",
+        result.run_id,
+        result.exit_code,
+        result.event_count,
+        result.tool_event_count,
+        result.robinhood_read_count,
+        result.mcp_error_count,
+        result.unexpected_tool_count
+    );
+    if let Some(report) = result.reconciliation.as_ref() {
+        println!(
+            "reconciliation status={}, accounts={}, balances={}, positions={}, pnl_trades={}, drift_items={}",
+            report.status,
+            report.account_count,
+            report.balance_count,
+            report.position_count,
+            report.pnl_trade_count,
+            report.drift.len()
+        );
+    }
+    println!("No configuration or execution flags were changed.");
+    if result.exit_code != Some(0) {
+        anyhow::bail!(
+            "Cline reconciliation process exited with {:?}",
+            result.exit_code
+        );
+    }
+    if result.unexpected_tool_count > 0 {
+        anyhow::bail!(
+            "Robinhood MCP reconciliation policy violation: {} unexpected tool call(s) were observed",
+            result.unexpected_tool_count
+        );
+    }
+    if result.mcp_error_count > 0 || result.reconciliation.is_none() {
+        anyhow::bail!("Robinhood MCP reconciliation did not complete successfully");
+    }
+    if result
+        .reconciliation
+        .as_ref()
+        .is_some_and(|report| report.status == "drift_detected")
+    {
+        anyhow::bail!("Robinhood MCP reconciliation detected state drift");
     }
     Ok(())
 }

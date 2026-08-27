@@ -1,0 +1,27 @@
+{
+  "structuredContent": {
+    "data": {
+      "account_number": "account-2",
+      "total_value": "1200.50",
+      "buying_power": "400.00",
+      "unleveraged_buying_power": "350.00",
+      "balances": {
+        "cash": "400.00",
+        "equity_value": "1200.50",
+        "unsettled_funds": "0.00"
+      },
+      "positions": [
+        {
+          "symbol": "TEST",
+          "instrument_id": "instrument-1",
+          "asset_class": "equity",
+          "quantity": "2",
+          "average_cost": "100.00",
+          "market_value": "220.00",
+          "current_price": "110.00",
+          "unrealized_pnl": "20.00"
+        }
+      ]
+    }
+  }
+}

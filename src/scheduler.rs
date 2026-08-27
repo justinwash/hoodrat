@@ -1,4 +1,4 @@
-use crate::agent::{run_fresh_task, Lane};
+use crate::agent::{run_fresh_task, run_read_only_reconciliation, Lane, ProcessAgentExecutor};
 use crate::config::Config;
 use crate::readiness::{check, ReadinessReport};
 use crate::store::Store;
@@ -25,6 +25,10 @@ pub fn run(config: &Config, store: &Store, once: bool) -> Result<()> {
     )?;
 
     if !report.ready {
+        return Ok(());
+    }
+
+    if !run_startup_reconciliation(config, store)? {
         return Ok(());
     }
 
@@ -72,6 +76,7 @@ pub fn run_from_path(config_path: &Path, once: bool) -> Result<()> {
     let mut last_crypto =
         Instant::now() - Duration::from_secs(config.schedule.crypto.interval_secs);
     let mut last_readiness: Option<bool> = None;
+    let mut reconciliation_ready: Option<bool> = None;
 
     loop {
         config = load_config(config_path)?;
@@ -94,9 +99,19 @@ pub fn run_from_path(config_path: &Path, once: bool) -> Result<()> {
                 }),
             )?;
             last_readiness = Some(report.ready);
+            if !report.ready {
+                reconciliation_ready = None;
+            }
         }
 
         if report.ready {
+            if reconciliation_ready.is_none() {
+                reconciliation_ready = Some(run_startup_reconciliation(&config, &store)?);
+            }
+            if reconciliation_ready != Some(true) {
+                thread::sleep(Duration::from_secs(1));
+                continue;
+            }
             let now = Instant::now();
             if config.schedule.equity_options.enabled
                 && now.duration_since(last_equity).as_secs()
@@ -116,6 +131,49 @@ pub fn run_from_path(config_path: &Path, once: bool) -> Result<()> {
         }
         thread::sleep(Duration::from_secs(1));
     }
+}
+
+fn run_startup_reconciliation(config: &Config, store: &Store) -> Result<bool> {
+    let result = run_read_only_reconciliation(
+        &config.agent,
+        store,
+        &config.robinhood.mcp_server_name,
+        &ProcessAgentExecutor,
+    );
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => {
+            store.record_audit(
+                None,
+                "reconciliation",
+                "blocked",
+                &serde_json::json!({"error": error.to_string()}),
+            )?;
+            eprintln!("startup reconciliation failed: {error:#}");
+            return Ok(false);
+        }
+    };
+    let report = result.reconciliation.as_ref();
+    let ready = result.exit_code == Some(0)
+        && result.mcp_error_count == 0
+        && result.unexpected_tool_count == 0
+        && report.is_some_and(|report| report.status != "drift_detected");
+    store.record_audit(
+        None,
+        "reconciliation",
+        if ready { "passed" } else { "blocked" },
+        &serde_json::json!({
+            "run_id": result.run_id,
+            "exit_code": result.exit_code,
+            "mcp_error_count": result.mcp_error_count,
+            "unexpected_tool_count": result.unexpected_tool_count,
+            "report": report,
+        }),
+    )?;
+    if !ready {
+        eprintln!("scheduler lanes blocked by startup reconciliation");
+    }
+    Ok(ready)
 }
 
 fn load_config(config_path: &Path) -> Result<Config> {

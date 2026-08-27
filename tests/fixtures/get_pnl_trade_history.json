@@ -1,0 +1,18 @@
+{
+  "structuredContent": {
+    "data": {
+      "trades": [
+        {
+          "trade_id": "trade-1",
+          "symbol": "TEST",
+          "asset_class": "equity",
+          "side": "sell",
+          "quantity": "1",
+          "realized_pnl": "12.34",
+          "opened_at": "2026-01-01T10:00:00Z",
+          "closed_at": "2026-01-01T15:00:00Z"
+        }
+      ]
+    }
+  }
+}

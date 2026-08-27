@@ -1,10 +1,10 @@
 use crate::config::AgentConfig;
 use crate::ingestion::{parse_json_text, BrokerDataSink, ExecutionRecord, PortfolioSnapshot};
-use crate::store::{AgentEventRecord, AgentToolEventRecord, Store};
+use crate::store::{AgentEventRecord, AgentToolEventRecord, ReconciliationReport, Store};
 use anyhow::{Context, Result};
 use chrono::Utc;
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -197,6 +197,7 @@ pub struct AgentRunResult {
     pub robinhood_read_count: u32,
     pub mcp_error_count: u32,
     pub unexpected_tool_count: u32,
+    pub reconciliation: Option<ReconciliationReport>,
 }
 
 #[derive(Debug, Clone)]
@@ -205,6 +206,8 @@ struct AgentTaskOptions {
     auto_approve: bool,
     system_prompt: Option<String>,
     expected_mcp_server: Option<String>,
+    expected_mcp_tools: Option<HashSet<String>>,
+    strict_typed_ingestion: bool,
 }
 
 pub fn build_prompt(lane: Lane, context: &str, config_summary: &str) -> String {
@@ -265,6 +268,8 @@ pub fn run_fresh_task_with_executor<E: AgentExecutor>(
             auto_approve: config.auto_approve,
             system_prompt: None,
             expected_mcp_server: None,
+            expected_mcp_tools: None,
+            strict_typed_ingestion: false,
         },
         executor,
     )
@@ -286,6 +291,41 @@ pub fn run_read_only_smoke_test<E: AgentExecutor>(
             auto_approve: true,
             system_prompt: Some(build_smoke_test_system_prompt(robinhood_server_name)),
             expected_mcp_server: Some(robinhood_server_name.to_owned()),
+            expected_mcp_tools: Some(HashSet::from(["get_accounts".to_owned()])),
+            strict_typed_ingestion: false,
+        },
+        executor,
+    )
+}
+
+pub fn run_read_only_reconciliation<E: AgentExecutor>(
+    config: &AgentConfig,
+    store: &Store,
+    robinhood_server_name: &str,
+    executor: &E,
+) -> Result<AgentRunResult> {
+    run_task_with_executor(
+        config,
+        store,
+        "reconciliation",
+        build_reconciliation_prompt(robinhood_server_name),
+        AgentTaskOptions {
+            plan_mode: true,
+            auto_approve: true,
+            system_prompt: Some(build_reconciliation_system_prompt(robinhood_server_name)),
+            expected_mcp_server: Some(robinhood_server_name.to_owned()),
+            expected_mcp_tools: Some(
+                [
+                    "get_accounts",
+                    "get_portfolio",
+                    "get_realized_pnl",
+                    "get_pnl_trade_history",
+                ]
+                .into_iter()
+                .map(ToOwned::to_owned)
+                .collect(),
+            ),
+            strict_typed_ingestion: true,
         },
         executor,
     )
@@ -300,6 +340,18 @@ fn build_smoke_test_system_prompt(server_name: &str) -> String {
 fn build_smoke_test_prompt(server_name: &str) -> String {
     format!(
         "Perform exactly one READ-ONLY Robinhood Trading MCP connectivity probe using only the configured MCP server '{server_name}'. Call only the read-only MCP tool 'get_accounts' on that server, then stop. Do not call any other tool, including skills, shell, filesystem, browser, delegation, coding, or any other MCP tool. Do not place, cancel, replace, or preview an order. Do not modify Robinhood state. Return only whether the get_accounts read succeeded and non-sensitive metadata."
+    )
+}
+
+fn build_reconciliation_system_prompt(server_name: &str) -> String {
+    format!(
+        "You are a read-only account reconciliation checker, not a coding agent. The only permitted external service is the Robinhood Trading MCP server named '{server_name}'. Do not inspect or modify the local workspace. Do not use filesystem, shell, browser, delegation, coding, checkpoint, or any built-in workspace tool. If a tool is unavailable or requires approval, report that fact and stop. Never place, cancel, replace, or preview an order. Never modify a watchlist, account setting, or any Robinhood state. Never expose credentials or tokens. You may call exactly these four MCP tools, once each, and no other tools: get_accounts, get_portfolio, get_realized_pnl, get_pnl_trade_history. Use the agent-accessible account returned by get_accounts for all subsequent account-scoped reads."
+    )
+}
+
+fn build_reconciliation_prompt(server_name: &str) -> String {
+    format!(
+        "Perform a startup READ-ONLY Robinhood account reconciliation using only the configured MCP server '{server_name}'. Call get_accounts exactly once with {{}}. From its returned data.accounts array, select the single object whose agentic_allowed field is true and copy that object's complete account_number string internally. The account_number must be passed unchanged in the MCP input; the instruction not to repeat account numbers applies only to your final response and not to tool arguments. Then make these three calls exactly once each, in this order: get_portfolio with {{account_number:<selected account_number>}}; get_realized_pnl with {{account_number:<selected account_number>,span:day,start_date:\"\",end_date:\"\",asset_classes:null,display_currency:USD,timezone:America/New_York}}; get_pnl_trade_history with {{account_number:<selected account_number>,span:week,symbol:\"\",cursor:\"\"}}. Do not call any other tool, including skills, shell, filesystem, browser, delegation, coding, or any other MCP tool. Do not place, cancel, replace, or preview an order. Do not modify Robinhood state. Do not stop after get_accounts or after an error: complete the remaining permitted read calls exactly once each. Return only success/failure and non-sensitive counts or schema metadata; never repeat account numbers, balances, positions, symbols, or tokens."
     )
 }
 
@@ -345,6 +397,8 @@ fn run_task_with_executor<E: AgentExecutor>(
     let mut mcp_error_count = 0;
     let mut unexpected_tool_count = 0;
     let mut pending_tools = HashMap::new();
+    let mut typed_payloads = BTreeMap::new();
+    let mut typed_ingestion_error = None;
 
     for (index, line) in raw_output.lines().enumerate() {
         let sequence_number = index as u32;
@@ -387,6 +441,14 @@ fn run_task_with_executor<E: AgentExecutor>(
         for tool in collect_tool_events(&value, &mut pending_tools) {
             let input = tool.input.as_ref().map(serde_json::to_string).transpose()?;
             let output_value = tool.output.as_ref().map(parse_json_text);
+            let output_is_error = output_value.as_ref().is_some_and(|output| {
+                output
+                    .get("isError")
+                    .or_else(|| output.get("is_error"))
+                    .and_then(Value::as_bool)
+                    == Some(true)
+            });
+            let tool_is_error = tool.is_error || output_is_error;
             let output_json = output_value
                 .as_ref()
                 .map(serde_json::to_string)
@@ -397,7 +459,7 @@ fn run_task_with_executor<E: AgentExecutor>(
                 tool_name: tool.storage_name(),
                 input_json: input,
                 output_json,
-                is_error: tool.is_error,
+                is_error: tool_is_error,
                 recorded_at: Utc::now().to_rfc3339(),
             })?;
             store.record_audit(
@@ -408,17 +470,18 @@ fn run_task_with_executor<E: AgentExecutor>(
                     "tool_name": tool.name,
                     "mcp_server": tool.server_name,
                     "mcp_tool": tool.mcp_tool_name,
-                    "is_error": tool.is_error,
+                    "is_error": tool_is_error,
                     "sequence_number": sequence_number,
                 }),
             )?;
             tool_event_count += 1;
-            if tool.is_error {
+            if tool_is_error {
                 mcp_error_count += u32::from(tool.server_name.is_some());
             }
             if let Some(expected_server) = options.expected_mcp_server.as_deref() {
-                let is_expected_read = tool.is_smoke_read(expected_server);
-                if is_expected_read && !tool.is_error {
+                let is_expected_read =
+                    tool.is_expected_read(expected_server, options.expected_mcp_tools.as_ref());
+                if is_expected_read && !tool_is_error {
                     robinhood_read_count += 1;
                 }
                 if !is_expected_read {
@@ -429,9 +492,33 @@ fn run_task_with_executor<E: AgentExecutor>(
                 || options
                     .expected_mcp_server
                     .as_deref()
-                    .is_some_and(|server| tool.is_smoke_read(server) && !tool.is_error)
+                    .is_some_and(|server| {
+                        tool.is_expected_read(server, options.expected_mcp_tools.as_ref())
+                            && !tool_is_error
+                    })
             {
-                ingest_tool_output(store, &run_id, tool.target_name(), output_value.as_ref())?;
+                if options.strict_typed_ingestion {
+                    let Some(output) = output_value.as_ref() else {
+                        typed_ingestion_error = Some(format!(
+                            "read-only reconciliation tool '{}' returned no output",
+                            tool.target_name()
+                        ));
+                        continue;
+                    };
+                    match store.ingest_typed_broker_payload(tool.target_name(), output) {
+                        Ok(_) => {
+                            typed_payloads.insert(tool.target_name().to_owned(), output.clone());
+                        }
+                        Err(error) => {
+                            typed_ingestion_error = Some(format!(
+                                "typed ingestion for '{}' failed: {error:#}",
+                                tool.target_name()
+                            ));
+                        }
+                    }
+                } else {
+                    ingest_tool_output(store, &run_id, tool.target_name(), output_value.as_ref())?;
+                }
             }
         }
     }
@@ -462,6 +549,37 @@ fn run_task_with_executor<E: AgentExecutor>(
     {
         status = "policy_violation";
     }
+    let reconciliation = if options.strict_typed_ingestion && output.status.success() {
+        let expected_count = options.expected_mcp_tools.as_ref().map_or(0, HashSet::len);
+        if let Some(error) = typed_ingestion_error.as_deref() {
+            status = "reconciliation_failed";
+            summary.push_str("\nTyped ingestion error: ");
+            summary.push_str(error);
+            None
+        } else if mcp_error_count > 0 {
+            status = "reconciliation_failed";
+            None
+        } else if robinhood_read_count as usize != expected_count
+            || typed_payloads.len() != expected_count
+        {
+            status = "reconciliation_incomplete";
+            None
+        } else {
+            let report = store.finalize_reconciliation(&typed_payloads)?;
+            if report.status == "drift_detected" {
+                status = "drift_detected";
+            }
+            Some(report)
+        }
+    } else {
+        None
+    };
+    if let Some(report) = reconciliation.as_ref() {
+        status = match report.status.as_str() {
+            "baseline" | "reconciled" | "drift_detected" => report.status.as_str(),
+            _ => status,
+        };
+    }
     store.finish_run(&run_id, status, &raw_output, &summary)?;
     store.record_audit(
         Some(&run_id),
@@ -475,6 +593,7 @@ fn run_task_with_executor<E: AgentExecutor>(
             "robinhood_read_count": robinhood_read_count,
             "mcp_error_count": mcp_error_count,
             "unexpected_tool_count": unexpected_tool_count,
+            "typed_ingestion_error": typed_ingestion_error,
             "elapsed_ms": started.elapsed().as_millis(),
         }),
     )?;
@@ -487,6 +606,7 @@ fn run_task_with_executor<E: AgentExecutor>(
         robinhood_read_count,
         mcp_error_count,
         unexpected_tool_count,
+        reconciliation,
     })
 }
 
@@ -531,9 +651,17 @@ impl ToolEvent {
         )
     }
 
-    fn is_smoke_read(&self, expected_server: &str) -> bool {
+    fn is_expected_read(
+        &self,
+        expected_server: &str,
+        expected_tools: Option<&HashSet<String>>,
+    ) -> bool {
         self.server_name.as_deref() == Some(expected_server)
-            && self.target_name().eq_ignore_ascii_case("get_accounts")
+            && expected_tools.is_some_and(|tools| {
+                tools
+                    .iter()
+                    .any(|tool| tool.eq_ignore_ascii_case(self.target_name()))
+            })
     }
 }
 
@@ -1098,6 +1226,64 @@ mod tests {
         assert_eq!(
             store.latest_run().unwrap().unwrap().status,
             "policy_violation"
+        );
+    }
+
+    #[test]
+    fn reconciliation_requires_exactly_four_typed_robinhood_reads() {
+        let output = concat!(
+            "{\"type\":\"agent_event\",\"event\":{\"type\":\"content_start\",\"contentType\":\"tool\",\"toolName\":\"robinhood-trading__get_accounts\",\"toolCallId\":\"accounts\",\"input\":{}}}\n",
+            "{\"type\":\"agent_event\",\"event\":{\"type\":\"content_end\",\"contentType\":\"tool\",\"toolName\":\"robinhood-trading__get_accounts\",\"toolCallId\":\"accounts\",\"output\":{\"structuredContent\":{\"data\":{\"accounts\":[{\"account_number\":\"account-1\",\"agentic_allowed\":true}]}}}}}\n",
+            "{\"type\":\"agent_event\",\"event\":{\"type\":\"content_start\",\"contentType\":\"tool\",\"toolName\":\"robinhood-trading__get_portfolio\",\"toolCallId\":\"portfolio\",\"input\":{\"account_number\":\"account-1\"}}}\n",
+            "{\"type\":\"agent_event\",\"event\":{\"type\":\"content_end\",\"contentType\":\"tool\",\"toolName\":\"robinhood-trading__get_portfolio\",\"toolCallId\":\"portfolio\",\"output\":{\"structuredContent\":{\"data\":{\"total_value\":\"100\",\"buying_power\":\"50\"}}}}}\n",
+            "{\"type\":\"agent_event\",\"event\":{\"type\":\"content_start\",\"contentType\":\"tool\",\"toolName\":\"robinhood-trading__get_realized_pnl\",\"toolCallId\":\"pnl\",\"input\":{\"account_number\":\"account-1\"}}}\n",
+            "{\"type\":\"agent_event\",\"event\":{\"type\":\"content_end\",\"contentType\":\"tool\",\"toolName\":\"robinhood-trading__get_realized_pnl\",\"toolCallId\":\"pnl\",\"output\":{\"structuredContent\":{\"data\":{\"realized_gain\":\"1.25\",\"window\":\"day\"}}}}}\n",
+            "{\"type\":\"agent_event\",\"event\":{\"type\":\"content_start\",\"contentType\":\"tool\",\"toolName\":\"robinhood-trading__get_pnl_trade_history\",\"toolCallId\":\"history\",\"input\":{\"account_number\":\"account-1\"}}}\n",
+            "{\"type\":\"agent_event\",\"event\":{\"type\":\"content_end\",\"contentType\":\"tool\",\"toolName\":\"robinhood-trading__get_pnl_trade_history\",\"toolCallId\":\"history\",\"output\":{\"structuredContent\":{\"data\":{\"trades\":[{\"trade_id\":\"trade-1\",\"symbol\":\"TEST\",\"realized_pnl\":\"1.25\"}]}}}}}\n"
+        );
+        let executor = FakeExecutor {
+            stdout: output.as_bytes().to_vec(),
+            stderr: Vec::new(),
+            status: success_status(),
+        };
+        let store = Store::open(std::path::Path::new(":memory:")).unwrap();
+        let result = run_read_only_reconciliation(
+            &AgentConfig::default(),
+            &store,
+            "robinhood-trading",
+            &executor,
+        )
+        .unwrap();
+        assert_eq!(result.robinhood_read_count, 4);
+        assert_eq!(result.unexpected_tool_count, 0);
+        assert_eq!(result.reconciliation.as_ref().unwrap().status, "baseline");
+        assert_eq!(store.latest_run().unwrap().unwrap().status, "baseline");
+    }
+
+    #[test]
+    fn reconciliation_rejects_non_robinhood_tools_even_when_process_succeeds() {
+        let output = concat!(
+            "{\"type\":\"agent_event\",\"event\":{\"type\":\"content_start\",\"contentType\":\"tool\",\"toolName\":\"run_commands\",\"toolCallId\":\"call-shell\",\"input\":{\"commands\":[\"echo blocked\"]}}}\n",
+            "{\"type\":\"agent_event\",\"event\":{\"type\":\"content_end\",\"contentType\":\"tool\",\"toolName\":\"run_commands\",\"toolCallId\":\"call-shell\",\"output\":{\"ok\":true}}}\n"
+        );
+        let executor = FakeExecutor {
+            stdout: output.as_bytes().to_vec(),
+            stderr: Vec::new(),
+            status: success_status(),
+        };
+        let store = Store::open(std::path::Path::new(":memory:")).unwrap();
+        let result = run_read_only_reconciliation(
+            &AgentConfig::default(),
+            &store,
+            "robinhood-trading",
+            &executor,
+        )
+        .unwrap();
+        assert_eq!(result.unexpected_tool_count, 1);
+        assert!(result.reconciliation.is_none());
+        assert_eq!(
+            store.latest_run().unwrap().unwrap().status,
+            "reconciliation_incomplete"
         );
     }
 }

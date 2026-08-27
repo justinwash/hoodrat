@@ -122,6 +122,22 @@ call observed. A successful Cline exit alone is not sufficient. Plan mode and
 the prompt reduce write risk, but direct MCP access still means this is not an
 application-owned pre-trade firewall.
 
+Run the broader typed read-only account reconciliation:
+
+```text
+cargo run -- reconcile
+```
+
+This command remains fail-closed and requires `execution.mode=disabled`, an
+engaged kill switch, an unconfirmed risk policy, and `agentic_account_only=true`.
+It permits exactly four Robinhood reads—`get_accounts`, `get_portfolio`,
+`get_realized_pnl`, and `get_pnl_trade_history`—and persists both the raw MCP
+envelopes and recognized typed records. The first successful run establishes a
+baseline. Later successful runs compare account, balance, position, PnL, and
+realized-trade fingerprints; detected drift blocks scheduler lanes until it is
+reviewed. Any missing read, MCP error, typed parsing error, or non-Robinhood
+tool use blocks reconciliation.
+
 Run the dashboard:
 
 ```text
@@ -170,6 +186,8 @@ The database defaults to `data/hoodrat.db`. It contains:
 - append-only audit events;
 - portfolio snapshots;
 - execution records;
+- typed broker accounts, balances, positions, realized PnL snapshots, and PnL trade history;
+- reconciliation runs, raw read payloads, stable fingerprints, and drift status;
 - schema version metadata.
 
 No API keys or Robinhood credentials belong in `hoodrat.json` or SQLite. Keep
@@ -182,9 +200,10 @@ store where applicable.
 - It does not infer or intercept every order tool call inside Cline output.
 - Rust risk checks are readiness and monitoring checks only under the direct
   MCP design; they are not a deterministic pre-trade firewall.
-- The scheduler does not yet calculate broker-confirmed PnL or reconstruct
-  fills from Robinhood. It only opportunistically normalizes clearly
-  recognizable portfolio/order tool results; unknown payloads remain raw.
+- The typed reconciliation currently covers the documented account, portfolio,
+  realized-PnL, and realized-PnL trade-history reads. It does not infer a full
+  order ledger from those reads; order/execution records remain a separate
+  opportunistic ingestion path until a documented order-history read is added.
 - Market hours are schedule guards, not an exchange calendar or an order
   execution guarantee.
 - No strategy recommends a symbol or trade. The strategy prompt is deliberately
@@ -198,4 +217,5 @@ Run formatting, tests, and the compiler checks with:
 cargo fmt --all -- --check
 cargo test
 cargo check
+cargo clippy --all-targets --all-features -- -D warnings
 ```

@@ -1,0 +1,38 @@
+{
+  "structuredContent": {
+    "data": {
+      "accounts": [
+        {
+          "account_number": "account-1",
+          "rhs_account_number": "rhs-1",
+          "rhc_account_number": "crypto-1",
+          "type": "cash",
+          "brokerage_account_type": "individual",
+          "is_default": true,
+          "agentic_allowed": false,
+          "option_level": "option_level_2",
+          "management_type": "self_directed",
+          "affiliate": "broker",
+          "state": "active",
+          "deactivated": false,
+          "permanently_deactivated": false
+        },
+        {
+          "account_number": "account-2",
+          "rhs_account_number": "rhs-2",
+          "type": "limited_margin",
+          "brokerage_account_type": "individual",
+          "nickname": "Agentic",
+          "is_default": false,
+          "agentic_allowed": true,
+          "option_level": "option_level_3",
+          "management_type": "self_directed",
+          "affiliate": "broker",
+          "state": "active",
+          "deactivated": false,
+          "permanently_deactivated": false
+        }
+      ]
+    }
+  }
+}
