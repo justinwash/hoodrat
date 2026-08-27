@@ -45,10 +45,15 @@ per-lane switches so they can be disabled independently.
 - A Robinhood Agentic account.
 - Robinhood Trading MCP authorization completed in Cline.
 
+On Windows, the app resolves npm-installed `cline.cmd` shims automatically.
+
 The planned Windows distribution will package the Cline CLI and a pinned Node
 runtime as sidecars. The current scaffold deliberately uses a configurable
 `agent.executable` so packaging can be added without changing the trading
-engine.
+engine. Hoodrat passes both `--config` and `--data-dir` to keep the bot's Cline
+profile separate from the user's global Cline profile. The generated defaults
+use `data/cline` as the Cline profile root and `data/cline/data` as its data
+directory.
 
 ## First run
 
@@ -74,18 +79,31 @@ https://agent.robinhood.com/mcp/trading
 The documented Cline setup command is:
 
 ```text
-cline --data-dir data/cline mcp add robinhood-trading --transport http https://agent.robinhood.com/mcp/trading
+cline --config data/cline --data-dir data/cline/data mcp add --yes --json --transport http robinhood-trading https://agent.robinhood.com/mcp/trading
 ```
 
-Then authenticate the server in Cline using that same `--data-dir`. The runner
-passes `--data-dir` on every fresh task, so configuring a different Cline data
-directory will not configure the profile Hoodrat uses. Use:
+Then authenticate the server in Cline using that same `--config` and
+`--data-dir`. The runner passes both flags on every fresh task, so configuring a
+different Cline profile will not configure the profile Hoodrat uses. Use:
 
 ```text
 cargo run -- doctor
 ```
 
 to inspect local readiness and print the setup instructions.
+
+Run the read-only connectivity smoke test after authenticating the MCP server:
+
+```text
+cargo run -- smoke-test
+```
+
+This command is separate from scheduled execution. It requires the application
+to remain disabled, the kill switch to remain engaged, and the risk policy to
+remain unconfirmed. It launches Cline with `--plan`, `--json`, and
+`--auto-approve false`, records the result in SQLite, and does not change the
+configuration. Plan mode and the prompt reduce write risk, but direct MCP
+access still means this is not an application-owned pre-trade firewall.
 
 Run the dashboard:
 

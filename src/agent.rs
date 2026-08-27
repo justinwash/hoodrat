@@ -4,6 +4,9 @@ use crate::store::{AgentEventRecord, AgentToolEventRecord, Store};
 use anyhow::{Context, Result};
 use chrono::Utc;
 use serde_json::Value;
+use std::collections::HashSet;
+use std::env;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::Instant;
 
@@ -37,30 +40,48 @@ pub struct AgentCommand {
 }
 
 impl AgentCommand {
+    #[allow(dead_code)]
     pub fn from_config(config: &AgentConfig, prompt: String) -> Self {
+        Self::from_config_with_options(config, prompt, false, config.auto_approve)
+    }
+
+    pub fn from_config_with_options(
+        config: &AgentConfig,
+        prompt: String,
+        plan_mode: bool,
+        auto_approve: bool,
+    ) -> Self {
+        let mut args = Vec::new();
+        if plan_mode {
+            args.push("--plan".to_owned());
+        }
+        args.extend([
+            "--json".to_owned(),
+            "--model".to_owned(),
+            config.model.clone(),
+            "--provider".to_owned(),
+            config.provider.clone(),
+            "--timeout".to_owned(),
+            config.timeout_secs.to_string(),
+            "--auto-approve".to_owned(),
+            auto_approve.to_string(),
+            "--data-dir".to_owned(),
+            config.data_dir.display().to_string(),
+            "--config".to_owned(),
+            config.config_dir.display().to_string(),
+            prompt,
+        ]);
         Self {
             executable: config.executable.clone(),
-            args: vec![
-                "--json".to_owned(),
-                "--model".to_owned(),
-                config.model.clone(),
-                "--provider".to_owned(),
-                config.provider.clone(),
-                "--timeout".to_owned(),
-                config.timeout_secs.to_string(),
-                "--auto-approve".to_owned(),
-                config.auto_approve.to_string(),
-                "--data-dir".to_owned(),
-                config.data_dir.display().to_string(),
-                prompt,
-            ],
+            args,
             working_directory: config.working_directory.clone(),
         }
     }
 
     fn spawn(&self) -> Result<Output> {
-        let mut command = Command::new(&self.executable);
-        command.args(&self.args);
+        let executable =
+            resolve_executable(&self.executable).unwrap_or_else(|| PathBuf::from(&self.executable));
+        let mut command = process_command(&executable, &self.args);
         if let Some(directory) = &self.working_directory {
             command.current_dir(directory);
         }
@@ -68,6 +89,78 @@ impl AgentCommand {
             .output()
             .with_context(|| format!("failed to launch Cline executable '{}'", self.executable))
     }
+}
+
+pub fn resolve_executable(executable: &str) -> Option<PathBuf> {
+    let configured_path = Path::new(executable);
+    let has_directory = configured_path
+        .parent()
+        .is_some_and(|parent| !parent.as_os_str().is_empty() && parent != Path::new("."));
+    if configured_path.is_absolute() || has_directory {
+        return configured_path
+            .is_file()
+            .then(|| configured_path.to_path_buf());
+    }
+
+    let candidates = if cfg!(windows) && configured_path.extension().is_none() {
+        vec![
+            format!("{executable}.cmd"),
+            format!("{executable}.exe"),
+            format!("{executable}.bat"),
+            executable.to_owned(),
+        ]
+    } else {
+        vec![executable.to_owned()]
+    };
+
+    if let Some(path_variable) = env::var_os("PATH") {
+        for directory in env::split_paths(&path_variable) {
+            if let Some(path) = find_candidate(&directory, &candidates) {
+                return Some(path);
+            }
+        }
+    }
+
+    if cfg!(windows) {
+        if let Some(app_data) = env::var_os("APPDATA") {
+            if let Some(path) = find_candidate(&PathBuf::from(app_data).join("npm"), &candidates) {
+                return Some(path);
+            }
+        }
+    }
+
+    None
+}
+
+pub fn run_executable_version(executable: &str) -> Result<Output> {
+    let resolved = resolve_executable(executable).unwrap_or_else(|| PathBuf::from(executable));
+    process_command(&resolved, &["--version".to_owned()])
+        .output()
+        .with_context(|| format!("failed to launch executable '{executable}'"))
+}
+
+fn process_command(executable: &Path, args: &[String]) -> Command {
+    #[cfg(windows)]
+    if matches!(
+        executable.extension().and_then(|value| value.to_str()),
+        Some("cmd" | "bat")
+    ) {
+        let mut command = Command::new("cmd.exe");
+        command.arg("/D").arg("/S").arg("/C").arg(executable);
+        command.args(args);
+        return command;
+    }
+
+    let mut command = Command::new(executable);
+    command.args(args);
+    command
+}
+
+fn find_candidate(directory: &Path, candidates: &[String]) -> Option<PathBuf> {
+    candidates
+        .iter()
+        .map(|candidate| directory.join(candidate))
+        .find(|path| path.is_file())
 }
 
 pub trait AgentExecutor {
@@ -89,6 +182,12 @@ pub struct AgentRunResult {
     pub exit_code: Option<i32>,
     pub event_count: u32,
     pub tool_event_count: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AgentTaskOptions {
+    plan_mode: bool,
+    auto_approve: bool,
 }
 
 pub fn build_prompt(lane: Lane, context: &str, config_summary: &str) -> String {
@@ -139,14 +238,74 @@ pub fn run_fresh_task_with_executor<E: AgentExecutor>(
     executor: &E,
 ) -> Result<AgentRunResult> {
     let prompt = build_prompt(lane, context, config_summary);
-    let run_id = format!(
-        "{}-{}",
+    run_task_with_executor(
+        config,
+        store,
         lane.as_str(),
-        Utc::now().format("%Y%m%dT%H%M%S%.3fZ")
-    );
-    store.begin_run(&run_id, lane.as_str(), &prompt)?;
+        prompt,
+        AgentTaskOptions {
+            plan_mode: false,
+            auto_approve: config.auto_approve,
+        },
+        executor,
+    )
+}
 
-    let command = AgentCommand::from_config(config, prompt);
+pub fn run_read_only_smoke_test<E: AgentExecutor>(
+    config: &AgentConfig,
+    store: &Store,
+    executor: &E,
+) -> Result<AgentRunResult> {
+    run_task_with_executor(
+        config,
+        store,
+        "smoke_test",
+        build_smoke_test_prompt(),
+        AgentTaskOptions {
+            plan_mode: true,
+            auto_approve: false,
+        },
+        executor,
+    )
+}
+
+fn build_smoke_test_prompt() -> String {
+    "You are performing a READ-ONLY Robinhood Trading MCP connectivity smoke test.\n\n\
+Use the Robinhood Trading MCP server configured in this Cline profile. Verify\n\
+that read access works by retrieving current account, portfolio, buying power,\n\
+realized PnL, and recent trade-history information. If useful, retrieve a\n\
+read-only watchlist or market-data result as well.\n\n\
+STRICT SAFETY RULES:\n\
+- Do not place, cancel, replace, or preview an order.\n\
+- Do not create, rename, update, follow, unfollow, add to, or remove from a watchlist.\n\
+- Do not modify account settings or any other Robinhood state.\n\
+- Use only read-only account, portfolio, PnL, history, watchlist-read, search,\n\
+  and market-data tools.\n\
+- If a requested read tool is unavailable, report that fact instead of trying\n\
+  a write-capable alternative.\n\n\
+Return a concise report naming each tool called, whether it succeeded, and the\n\
+key non-sensitive fields observed. Never include credentials or access tokens.\n\
+This is a connectivity test, not an investment recommendation."
+        .to_owned()
+}
+
+fn run_task_with_executor<E: AgentExecutor>(
+    config: &AgentConfig,
+    store: &Store,
+    lane_label: &str,
+    prompt: String,
+    options: AgentTaskOptions,
+    executor: &E,
+) -> Result<AgentRunResult> {
+    let run_id = format!("{}-{}", lane_label, Utc::now().format("%Y%m%dT%H%M%S%.3fZ"));
+    store.begin_run(&run_id, lane_label, &prompt)?;
+
+    let command = AgentCommand::from_config_with_options(
+        config,
+        prompt,
+        options.plan_mode,
+        options.auto_approve,
+    );
     let started = Instant::now();
     let output = match executor.execute(&command) {
         Ok(output) => output,
@@ -237,7 +396,12 @@ pub fn run_fresh_task_with_executor<E: AgentExecutor>(
         }
     }
 
-    let mut summary = summary_parts.join("\n");
+    let mut seen_summary_parts = HashSet::new();
+    let mut summary = summary_parts
+        .into_iter()
+        .filter(|part| seen_summary_parts.insert(part.clone()))
+        .collect::<Vec<_>>()
+        .join("\n");
     if !stderr.trim().is_empty() {
         summary.push_str("\nCline stderr: ");
         summary.push_str(stderr.trim());
@@ -256,7 +420,7 @@ pub fn run_fresh_task_with_executor<E: AgentExecutor>(
         "agent",
         "task_finished",
         &serde_json::json!({
-            "lane": lane.as_str(),
+            "lane": lane_label,
             "exit_code": output.status.code(),
             "event_count": event_count,
             "tool_event_count": tool_event_count,
@@ -360,12 +524,30 @@ fn ingest_tool_output(
 }
 
 fn event_text(value: &Value) -> Option<String> {
-    ["text", "say", "ask", "reasoning"].iter().find_map(|key| {
+    if let Some(text) = ["text", "say", "ask", "reasoning"].iter().find_map(|key| {
         value
             .get(*key)
             .and_then(Value::as_str)
             .map(ToOwned::to_owned)
-    })
+    }) {
+        return Some(text);
+    }
+    if let Some(message) = value
+        .get("error")
+        .and_then(Value::as_object)
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+    {
+        return Some(message.to_owned());
+    }
+    for key in ["event", "result"] {
+        if let Some(nested) = value.get(key) {
+            if let Some(text) = event_text(nested) {
+                return Some(text);
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -433,8 +615,35 @@ mod tests {
         assert!(command
             .args
             .windows(2)
-            .any(|pair| pair == ["--data-dir", "data/cline"]));
+            .any(|pair| pair == ["--data-dir", "data/cline/data"]));
+        assert!(command
+            .args
+            .windows(2)
+            .any(|pair| pair == ["--config", "data/cline"]));
         assert_eq!(command.args.last(), Some(&"prompt".to_owned()));
+    }
+
+    #[test]
+    fn resolves_installed_cline_entrypoint_when_available() {
+        if let Some(path) = resolve_executable("cline") {
+            assert!(path.is_file());
+            assert!(matches!(
+                path.extension().and_then(|value| value.to_str()),
+                Some("cmd") | Some("exe") | Some("bat") | Some("")
+            ));
+        }
+    }
+
+    #[test]
+    fn smoke_test_command_forces_plan_and_no_auto_approval() {
+        let config = AgentConfig::default();
+        let command =
+            AgentCommand::from_config_with_options(&config, "read only".to_owned(), true, false);
+        assert_eq!(command.args.first(), Some(&"--plan".to_owned()));
+        assert!(command
+            .args
+            .windows(2)
+            .any(|pair| pair == ["--auto-approve", "false"]));
     }
 
     #[test]
@@ -448,6 +657,18 @@ mod tests {
             Some("ok".to_owned())
         );
         assert_eq!(event_text(&serde_json::json!({"type":"say"})), None);
+    }
+
+    #[test]
+    fn extracts_nested_cline_error_messages() {
+        let value = serde_json::json!({
+            "type": "agent_event",
+            "event": {
+                "type": "error",
+                "error": {"message": "provider unavailable"}
+            }
+        });
+        assert_eq!(event_text(&value), Some("provider unavailable".to_owned()));
     }
 
     #[test]
@@ -510,5 +731,38 @@ mod tests {
             .unwrap()
             .iter()
             .any(|event| event.event_type == "unstructured"));
+    }
+
+    #[test]
+    fn failed_process_exit_is_persisted_as_failed_run() {
+        let executor = FakeExecutor {
+            stdout: br#"{"type":"say","text":"failed"}"#.to_vec(),
+            stderr: b"provider unavailable".to_vec(),
+            status: if cfg!(windows) {
+                Command::new("cmd")
+                    .args(["/C", "exit", "7"])
+                    .status()
+                    .unwrap()
+            } else {
+                Command::new("sh").args(["-c", "exit 7"]).status().unwrap()
+            },
+        };
+        let store = Store::open(std::path::Path::new(":memory:")).unwrap();
+        let result = run_read_only_smoke_test(&AgentConfig::default(), &store, &executor).unwrap();
+        assert_eq!(result.exit_code, Some(7));
+        assert_eq!(store.latest_run().unwrap().unwrap().status, "failed");
+    }
+
+    #[test]
+    fn smoke_test_uses_dedicated_run_label() {
+        let executor = FakeExecutor {
+            stdout: br#"{"type":"say","text":"read only"}"#.to_vec(),
+            stderr: Vec::new(),
+            status: success_status(),
+        };
+        let store = Store::open(std::path::Path::new(":memory:")).unwrap();
+        let result = run_read_only_smoke_test(&AgentConfig::default(), &store, &executor).unwrap();
+        assert!(result.run_id.starts_with("smoke_test-"));
+        assert_eq!(result.tool_event_count, 0);
     }
 }

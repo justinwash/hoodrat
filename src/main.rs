@@ -5,13 +5,13 @@ mod readiness;
 mod scheduler;
 mod store;
 
+use agent::{run_executable_version, run_read_only_smoke_test};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use config::{default_config_path, Config};
 use readiness::check;
 use scheduler::{run as run_scheduler, run_from_path as run_scheduler_from_path};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::{Arc, Mutex};
 use store::Store;
 
@@ -36,6 +36,8 @@ enum CommandKind {
     Init,
     /// Inspect configuration and local Cline/MCP readiness.
     Doctor,
+    /// Run a read-only Cline/Robinhood MCP connectivity test.
+    SmokeTest,
     /// Run scheduled agent evaluations.
     Run {
         /// Evaluate each enabled lane once instead of running continuously.
@@ -51,6 +53,7 @@ fn main() -> Result<()> {
     match cli.command {
         CommandKind::Init => initialize(&cli.config),
         CommandKind::Doctor => doctor(&cli.config),
+        CommandKind::SmokeTest => smoke_test(&cli.config),
         CommandKind::Run { once } => run(cli.config, once),
         CommandKind::Dashboard => dashboard(cli.config),
     }
@@ -94,6 +97,25 @@ fn doctor(config_path: &Path) -> Result<()> {
         config.execution.kill_switch_engaged
     );
     println!("Cline executable: {}", config.agent.executable);
+    println!(
+        "Cline config directory: {}",
+        config.agent.config_dir.display()
+    );
+    println!("Cline data directory: {}", config.agent.data_dir.display());
+    println!(
+        "Cline resolved executable: {}",
+        agent::resolve_executable(&config.agent.executable)
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "not found".to_owned())
+    );
+    println!(
+        "Cline provider settings: {}",
+        settings_file_status(&config.agent.data_dir, "providers.json")
+    );
+    println!(
+        "Cline MCP settings: {}",
+        settings_file_status(&config.agent.data_dir, "cline_mcp_settings.json")
+    );
     println!("Cline model: {}", config.agent.model);
     println!("Cline provider: {}", config.agent.provider);
     println!("session mode: {:?}", config.agent.session_mode);
@@ -108,10 +130,7 @@ fn doctor(config_path: &Path) -> Result<()> {
         println!("  note: {note}");
     }
 
-    match Command::new(&config.agent.executable)
-        .arg("--version")
-        .output()
-    {
+    match run_executable_version(&config.agent.executable) {
         Ok(output) if output.status.success() => {
             println!("Cline executable check: available");
         }
@@ -125,12 +144,61 @@ fn doctor(config_path: &Path) -> Result<()> {
     println!();
     println!("Robinhood setup command documented by Robinhood:");
     println!(
-        "  cline --data-dir {} mcp add robinhood-trading --transport http {}",
+        "  cline --config {} --data-dir {} mcp add --yes --json --transport http robinhood-trading {}",
+        config.agent.config_dir.display(),
         config.agent.data_dir.display(),
         config.robinhood.trading_mcp_url
     );
-    println!("Use the same --data-dir for Cline authentication and every Hoodrat run.");
+    println!(
+        "Use the same --config and --data-dir for Cline authentication and every Hoodrat run."
+    );
     println!("Then authenticate the server in Cline and mark connection_ready=true only after verification.");
+    Ok(())
+}
+
+fn smoke_test(config_path: &Path) -> Result<()> {
+    let (config, store) = load_runtime(config_path)?;
+
+    if config.execution.mode != config::ExecutionMode::Disabled {
+        anyhow::bail!("smoke-test requires execution.mode=disabled");
+    }
+    if !config.execution.kill_switch_engaged {
+        anyhow::bail!("smoke-test requires the kill switch to remain engaged");
+    }
+    if config.risk.confirmed {
+        anyhow::bail!("smoke-test requires risk.confirmed=false");
+    }
+    if !config.robinhood.agentic_account_only {
+        anyhow::bail!("smoke-test requires robinhood.agentic_account_only=true");
+    }
+
+    println!("starting read-only MCP smoke test");
+    println!("Cline executable: {}", config.agent.executable);
+    println!(
+        "Cline config directory: {}",
+        config.agent.config_dir.display()
+    );
+    println!("Cline data directory: {}", config.agent.data_dir.display());
+    println!("Robinhood MCP: {}", config.robinhood.trading_mcp_url);
+    println!("safety mode: plan=true, auto_approve=false");
+
+    let result = run_read_only_smoke_test(&config.agent, &store, &agent::ProcessAgentExecutor)?;
+    println!(
+        "smoke test run {} finished with exit={:?}, events={}, tool_events={}",
+        result.run_id, result.exit_code, result.event_count, result.tool_event_count
+    );
+    println!(
+        "portfolio snapshots ingested: {}",
+        store.portfolio_snapshot_count()?
+    );
+    println!("executions ingested: {}", store.execution_count()?);
+    println!("No configuration or execution flags were changed.");
+    if result.exit_code != Some(0) {
+        anyhow::bail!(
+            "Cline smoke-test process exited with {:?}",
+            result.exit_code
+        );
+    }
     Ok(())
 }
 
@@ -247,4 +315,12 @@ fn format_money(value: Option<f64>) -> String {
     value
         .map(|value| format!("${value:.2}"))
         .unwrap_or_else(|| "—".to_owned())
+}
+
+fn settings_file_status(data_dir: &Path, file_name: &str) -> &'static str {
+    if data_dir.join("settings").join(file_name).is_file() {
+        "present"
+    } else {
+        "missing"
+    }
 }

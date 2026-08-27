@@ -62,6 +62,8 @@ pub struct AgentConfig {
     #[serde(default = "default_cline_executable")]
     pub executable: String,
     pub working_directory: Option<PathBuf>,
+    #[serde(default = "default_cline_config_dir")]
+    pub config_dir: PathBuf,
     #[serde(default = "default_cline_data_dir")]
     pub data_dir: PathBuf,
     #[serde(default = "default_provider")]
@@ -81,6 +83,7 @@ impl Default for AgentConfig {
         Self {
             executable: default_cline_executable(),
             working_directory: None,
+            config_dir: default_cline_config_dir(),
             data_dir: default_cline_data_dir(),
             provider: default_provider(),
             model: default_model(),
@@ -290,6 +293,9 @@ impl Config {
         if !self.agent.data_dir.is_absolute() {
             self.agent.data_dir = base.join(&self.agent.data_dir);
         }
+        if !self.agent.config_dir.is_absolute() {
+            self.agent.config_dir = base.join(&self.agent.config_dir);
+        }
         if let Some(directory) = &self.agent.working_directory {
             if !directory.is_absolute() {
                 self.agent.working_directory = Some(base.join(directory));
@@ -322,6 +328,9 @@ fn default_cline_executable() -> String {
     "cline".to_owned()
 }
 fn default_cline_data_dir() -> PathBuf {
+    PathBuf::from("data/cline/data")
+}
+fn default_cline_config_dir() -> PathBuf {
     PathBuf::from("data/cline")
 }
 fn default_provider() -> String {
@@ -420,6 +429,10 @@ mod tests {
         );
         assert_eq!(
             config.agent.data_dir,
+            PathBuf::from("profiles/dev/data/cline/data")
+        );
+        assert_eq!(
+            config.agent.config_dir,
             PathBuf::from("profiles/dev/data/cline")
         );
     }

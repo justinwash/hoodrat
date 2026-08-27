@@ -7,7 +7,8 @@
   "agent": {
     "executable": "cline",
     "working_directory": null,
-    "data_dir": "data/cline",
+    "config_dir": "data/cline",
+    "data_dir": "data/cline/data",
     "provider": "openai-compatible",
     "model": "gpt-5.6-luna",
     "timeout_secs": 300,
