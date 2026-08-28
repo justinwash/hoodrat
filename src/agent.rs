@@ -128,6 +128,15 @@ impl AgentCommand {
         let executable =
             resolve_executable(&self.executable).unwrap_or_else(|| PathBuf::from(&self.executable));
         let mut command = process_command(&executable, &self.args);
+        #[cfg(debug_assertions)]
+        {
+            let mut line = executable.display().to_string();
+            for a in &self.args {
+                line.push(' ');
+                line.push_str(a);
+            }
+            eprintln!("[spawn] exec='{}' argv_len={}", executable.display(), line.len());
+        }
         let settings_guard = if self.restrict_local_tools {
             Some(prepare_read_only_cline_tools(&self.cline_data_dir)?)
         } else {

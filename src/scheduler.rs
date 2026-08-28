@@ -263,12 +263,22 @@ fn strategy_allows_lane(strategy: &StrategyContract, lane: Lane) -> bool {
 fn build_context(store: &Store) -> Result<String> {
     let latest = store.latest_run()?;
     let events = store.recent_events(10)?;
-    Ok(serde_json::to_string_pretty(&serde_json::json!({
+    let mut context = serde_json::to_string_pretty(&serde_json::json!({
         "generated_at": Utc::now().to_rfc3339(),
         "latest_run": latest,
         "recent_agent_events": events,
         "portfolio_snapshot": "not ingested yet; retrieve it through Robinhood MCP",
-    }))?)
+    }))?;
+    // Cap the persisted-context blob so the resulting Cline command line stays
+    // well under the Windows 32,767-char limit. Recent agent events can be
+    // large when they embed raw hook/tool JSON; a truncated context is
+    // sufficient for the analyst prompt (it re-retrieves live data anyway).
+    const MAX_CONTEXT_CHARS: usize = 12_000;
+    if context.len() > MAX_CONTEXT_CHARS {
+        context.truncate(MAX_CONTEXT_CHARS);
+        context.push_str("\n…[context truncated to keep the command line within limits]");
+    }
+    Ok(context)
 }
 
 fn equity_options_open(config: &Config) -> bool {
