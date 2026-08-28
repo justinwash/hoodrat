@@ -57,16 +57,42 @@ pub struct AgentToolEventRecord {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct DashboardSnapshot {
+    // Status header
     pub bot_status: String,
+    pub execution_mode: String,
+    pub risk_status: String,
+    pub database_path: String,
     pub last_run: String,
     pub last_run_status: String,
-    pub recent_events: String,
-    pub database_path: String,
+    // KPI numeric values (for the header cards / coloring)
     pub portfolio_value: Option<f64>,
     pub buying_power: Option<f64>,
+    pub cash: Option<f64>,
+    pub equity: Option<f64>,
     pub realized_pnl: Option<f64>,
+    pub unrealized_pnl: Option<f64>,
+    // Reconciliation status card
     pub reconciliation_status: String,
     pub reconciliation_details: String,
+    // Charts: SVG path-command strings computed by Rust
+    pub equity_chart_path: String,
+    pub equity_chart_labels: String,
+    pub pnl_chart_path: String,
+    // Tables (pre-formatted monospace text rendered in ScrollView/ListView)
+    pub overview_stats: String,
+    pub accounts_table: String,
+    pub balances_table: String,
+    pub positions_table: String,
+    pub pnl_snapshots_table: String,
+    pub pnl_trades_table: String,
+    pub runs_table: String,
+    pub tool_events_table: String,
+    pub audit_table: String,
+    pub reconciliations_table: String,
+    pub baseline_acceptances_table: String,
+    pub strategy_table: String,
+    pub recent_events: String,
+    pub simulation_table: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -826,12 +852,14 @@ impl Store {
 
     pub fn dashboard_snapshot(&self, database_path: &Path) -> Result<DashboardSnapshot> {
         let latest = self.latest_run()?;
-        let events = self.recent_events(12)?;
+        let events = self.recent_events(50)?;
         let metrics = self.latest_portfolio_metrics()?;
         let reconciliation = self.latest_reconciliation()?;
+
         let recent_events = events
             .iter()
             .rev()
+            .take(20)
             .map(|event| {
                 format!(
                     "[{}] {}: {}",
@@ -842,8 +870,19 @@ impl Store {
             })
             .collect::<Vec<_>>()
             .join("\n");
+
+        let (equity_chart_path, equity_chart_labels) = self.equity_chart()?;
+        let pnl_chart_path = self.pnl_chart()?;
+        let balances = self.balance_history(30)?;
+        let latest_balance = balances.first();
+        let cash = latest_balance.and_then(|b| b.cash_usd);
+        let equity = latest_balance.and_then(|b| b.equity_usd);
+
         Ok(DashboardSnapshot {
-            bot_status: "READY FOR CONFIGURATION".to_owned(),
+            bot_status: "—".to_owned(),
+            execution_mode: "—".to_owned(),
+            risk_status: "—".to_owned(),
+            database_path: database_path.display().to_string(),
             last_run: latest
                 .as_ref()
                 .map(|run| run.started_at.clone())
@@ -852,15 +891,12 @@ impl Store {
                 .as_ref()
                 .map(|run| run.status.clone())
                 .unwrap_or_else(|| "—".to_owned()),
-            recent_events: if recent_events.is_empty() {
-                "No agent events recorded.".to_owned()
-            } else {
-                recent_events
-            },
-            database_path: database_path.display().to_string(),
             portfolio_value: metrics.0,
             buying_power: metrics.1,
+            cash,
+            equity,
             realized_pnl: metrics.2,
+            unrealized_pnl: self.latest_unrealized_pnl()?,
             reconciliation_status: reconciliation
                 .as_ref()
                 .map(|report| report.status.clone())
@@ -869,7 +905,139 @@ impl Store {
                 .as_ref()
                 .map(reconciliation_details)
                 .unwrap_or_else(|| "No reconciliation recorded.".to_owned()),
+            equity_chart_path,
+            equity_chart_labels,
+            pnl_chart_path,
+            overview_stats: self.overview_stats(metrics, cash, equity)?,
+            accounts_table: self.accounts_table()?,
+            balances_table: self.balances_table()?,
+            positions_table: self.positions_table()?,
+            pnl_snapshots_table: self.pnl_snapshots_table()?,
+            pnl_trades_table: self.pnl_trades_table()?,
+            runs_table: self.runs_table()?,
+            tool_events_table: self.tool_events_table()?,
+            audit_table: self.audit_table()?,
+            reconciliations_table: self.reconciliations_table()?,
+            baseline_acceptances_table: self.baseline_acceptances_table()?,
+            strategy_table: String::new(),
+            recent_events: if recent_events.is_empty() {
+                "No agent events recorded.".to_owned()
+            } else {
+                recent_events
+            },
+            simulation_table: self.simulation_table()?,
         })
+    }
+
+    fn latest_unrealized_pnl(&self) -> Result<Option<f64>> {
+        self.connection
+            .query_row(
+                "SELECT unrealized_pnl_usd FROM portfolio_snapshots ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get::<_, Option<f64>>(0),
+            )
+            .optional()
+            .map(|v| v.flatten())
+            .map_err(Into::into)
+    }
+
+    /// Recent account balance history (cash/equity), most-recent first.
+    fn balance_history(&self, limit: u32) -> Result<Vec<BalanceRecord>> {
+        let mut statement = self.connection.prepare(
+            "SELECT captured_at, account_number, cash_usd, buying_power_usd, unleveraged_buying_power_usd, equity_usd, margin_used_usd, unsettled_funds_usd, raw_json FROM broker_balances ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = statement.query_map(params![limit], |row| {
+            Ok(BalanceRecord {
+                captured_at: row.get(0)?,
+                account_number: row.get(1)?,
+                cash_usd: row.get(2)?,
+                buying_power_usd: row.get(3)?,
+                unleveraged_buying_power_usd: row.get(4)?,
+                equity_usd: row.get(5)?,
+                margin_used_usd: row.get(6)?,
+                unsettled_funds_usd: row.get(7)?,
+                raw: parse_json(row.get::<_, String>(8)?),
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// Builds an SVG area-chart path for equity over time, oldest -> newest,
+    /// normalized to a 0..100 box so Slint can scale it via viewbox. Returns
+    /// the path commands and a short axis label string.
+    fn equity_chart(&self) -> Result<(String, String)> {
+        let balances = self.balance_history(120)?;
+        let values: Vec<f64> = balances.iter().filter_map(|b| b.equity_usd).rev().collect();
+        if values.len() < 2 {
+            return Ok((String::new(), String::new()));
+        }
+        let min = values.iter().cloned().fold(f64::INFINITY, f64::min);
+        let max = values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let span = (max - min).max(1.0);
+        let n = values.len() as f64;
+        let mut parts = Vec::with_capacity(values.len() * 2 + 3);
+        for (i, v) in values.iter().enumerate() {
+            let x = i as f64 / (n - 1.0);
+            let y = 1.0 - ((v - min) / span);
+            let cmd = if i == 0 { "M" } else { "L" };
+            parts.push(format!("{cmd}{:.4} {:.4}", x * 100.0, y * 100.0));
+        }
+        let path = format!("M0 100 {}", parts.join(" "));
+        let labels = format!(
+            "low {:.2}  ·  high {:.2}  ·  points {}",
+            min,
+            max,
+            values.len()
+        );
+        Ok((path, labels))
+    }
+
+    /// Grouped bar chart path showing total returns by span (per-last snapshot).
+    fn pnl_chart(&self) -> Result<String> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT span, total_returns_usd FROM broker_pnl_snapshots")?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<f64>>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut seen = std::collections::HashSet::new();
+        let buckets: Vec<(String, f64)> = rows
+            .into_iter()
+            .filter(|(s, _)| seen.insert(s.clone()))
+            .map(|(s, v)| (s, v.unwrap_or(0.0)))
+            .collect();
+        if buckets.is_empty() {
+            return Ok(String::new());
+        }
+        let max = buckets
+            .iter()
+            .map(|(_, v)| v.abs())
+            .fold(0.0, f64::max)
+            .max(1.0);
+        let n = buckets.len() as f64;
+        let bar_w = 12.0 / n.max(1.0);
+        let mut body = String::new();
+        for (i, (_, v)) in buckets.iter().enumerate() {
+            let cx = (i as f64 + 0.5) * (100.0 / n);
+            let h = (v.abs() / max) * 80.0;
+            let y0 = 100.0 - if *v >= 0.0 { h } else { 0.0 };
+            let y1 = if *v >= 0.0 { 100.0 } else { 100.0 + h };
+            body.push_str(&format!(
+                "M{:.2} {:.2} L{:.2} {:.2} L{:.2} {:.2} L{:.2} {:.2} ",
+                cx - bar_w / 2.0,
+                y0,
+                cx - bar_w / 2.0,
+                y1,
+                cx + bar_w / 2.0,
+                y1,
+                cx + bar_w / 2.0,
+                y0
+            ));
+        }
+        Ok(body.trim().to_owned())
     }
 
     fn latest_portfolio_metrics(&self) -> Result<(Option<f64>, Option<f64>, Option<f64>)> {
@@ -882,6 +1050,357 @@ impl Store {
             .optional()
             .map(|value| value.unwrap_or((None, None, None)))
             .map_err(Into::into)
+    }
+
+    fn overview_stats(
+        &self,
+        metrics: (Option<f64>, Option<f64>, Option<f64>),
+        cash: Option<f64>,
+        equity: Option<f64>,
+    ) -> Result<String> {
+        let summary = self.latest_summary()?;
+        let mut s = String::from("── ACCOUNT OVERVIEW ───────────────────────\n");
+        s.push_str(&format!(
+            "Total equity     {:>12}\n",
+            fmt_money(equity.or(metrics.0))
+        ));
+        s.push_str(&format!("Cash             {:>12}\n", fmt_money(cash)));
+        s.push_str(&format!("Buying power     {:>12}\n", fmt_money(metrics.1)));
+        s.push_str(&format!("Realized PnL     {:>12}\n", fmt_money(metrics.2)));
+        s.push_str(&format!(
+            "Unrealized PnL   {:>12}\n",
+            fmt_money(self.latest_unrealized_pnl()?)
+        ));
+        s.push_str("\n── LAST RUN ────────────────────────────────\n");
+        s.push_str(&summary);
+        Ok(s)
+    }
+
+    fn latest_summary(&self) -> Result<String> {
+        let run = self.latest_run()?;
+        Ok(match run {
+            Some(run) => format!(
+                "lane: {}\nstatus: {}\nstarted: {}\n{}",
+                run.lane,
+                run.status,
+                run.started_at,
+                run.summary.as_deref().unwrap_or("(no summary)")
+            ),
+            None => "No runs recorded.".to_owned(),
+        })
+    }
+
+    fn accounts_table(&self) -> Result<String> {
+        let mut s = String::from("ACCOUNT          TYPE          AGENTIC  OPTLVL   STATE\n");
+        let mut stmt = self.connection.prepare(
+            "SELECT account_number, account_type, agentic_allowed, option_level, state, nickname FROM broker_accounts ORDER BY rowid DESC LIMIT 30",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<bool>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+            ))
+        })?;
+        for r in rows {
+            let (acct, ty, agentic, opt, state, nick) = r?;
+            s.push_str(&format!(
+                "{:<15} {:<12} {:<8} {:<8} {:<10} {}\n",
+                acct,
+                ty.as_deref().unwrap_or("—"),
+                agentic.map(|b| if b { "YES" } else { "no" }).unwrap_or("—"),
+                opt.as_deref().unwrap_or("—"),
+                state.as_deref().unwrap_or("—"),
+                nick.as_deref().unwrap_or("")
+            ));
+        }
+        Ok(s)
+    }
+
+    fn balances_table(&self) -> Result<String> {
+        let mut s = String::from("TIME                    CASH      EQUITY\n");
+        for b in self.balance_history(40)? {
+            s.push_str(&format!(
+                "{:<24} {:<10} {:<10}\n",
+                short_ts(&b.captured_at),
+                fmt_money(b.cash_usd),
+                fmt_money(b.equity_usd)
+            ));
+        }
+        Ok(s)
+    }
+
+    fn positions_table(&self) -> Result<String> {
+        let mut stmt = self.connection.prepare(
+            "SELECT captured_at, symbol, asset_class, quantity, average_cost_usd, market_value_usd, current_price_usd, unrealized_pnl_usd FROM broker_positions ORDER BY rowid DESC LIMIT 100",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<f64>>(3)?,
+                row.get::<_, Option<f64>>(4)?,
+                row.get::<_, Option<f64>>(5)?,
+                row.get::<_, Option<f64>>(6)?,
+                row.get::<_, Option<f64>>(7)?,
+            ))
+        })?;
+        let mut s = String::from("SYMBOL   CLASS   QTY      COST      MV        UAV      UNREAL\n");
+        let mut count = 0;
+        for r in rows {
+            let (_, sym, class, qty, cost, mv, price, unreal) = r?;
+            count += 1;
+            s.push_str(&format!(
+                "{:<8} {:<7} {:<8} {:<10} {:<10} {:<10} {:<10}\n",
+                sym.as_deref().unwrap_or("—"),
+                class.as_deref().unwrap_or("—"),
+                fmt_opt(qty),
+                fmt_money(cost),
+                fmt_money(mv),
+                fmt_money(price),
+                fmt_money(unreal)
+            ));
+        }
+        if count == 0 {
+            s.push_str(
+                "No line-item positions captured.\nThe reconciliation get_portfolio read returns only aggregate totals,\nnot per-symbol holdings.",
+            );
+        }
+        Ok(s)
+    }
+
+    fn pnl_snapshots_table(&self) -> Result<String> {
+        let mut stmt = self.connection.prepare(
+            "SELECT span, start_date, end_date, realized_pnl_usd, total_returns_usd, number_of_trades FROM broker_pnl_snapshots ORDER BY rowid DESC LIMIT 40",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<f64>>(3)?,
+                row.get::<_, Option<f64>>(4)?,
+                row.get::<_, Option<f64>>(5)?,
+            ))
+        })?;
+        let mut s =
+            String::from("SPAN   FROM           TO             REALIZED  TOTAL     TRADES\n");
+        for r in rows {
+            let (span, from, to, rp, tr, n) = r?;
+            s.push_str(&format!(
+                "{:<6} {:<15} {:<15} {:<10} {:<10} {:<6}\n",
+                span,
+                from.as_deref().unwrap_or("—"),
+                to.as_deref().unwrap_or("—"),
+                fmt_money(rp),
+                fmt_money(tr),
+                n.map(|v: f64| format!("{v:.0}"))
+                    .unwrap_or_else(|| "—".into())
+            ));
+        }
+        Ok(s)
+    }
+
+    fn pnl_trades_table(&self) -> Result<String> {
+        let mut stmt = self.connection.prepare(
+            "SELECT captured_at, symbol, asset_class, side, quantity, realized_pnl_usd FROM broker_pnl_trades ORDER BY rowid DESC LIMIT 100",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<f64>>(4)?,
+                row.get::<_, Option<f64>>(5)?,
+            ))
+        })?;
+        let mut s = String::from("TIME                SYMBOL  CLASS  SIDE   QTY    REALIZED\n");
+        let mut n = 0;
+        for r in rows {
+            let (at, sym, class, side, qty, rp) = r?;
+            n += 1;
+            s.push_str(&format!(
+                "{:<19} {:<7} {:<6} {:<6} {:<6} {:<10}\n",
+                short_ts(&at),
+                sym.as_deref().unwrap_or("—"),
+                class.as_deref().unwrap_or("—"),
+                side.as_deref().unwrap_or("—"),
+                fmt_opt(qty),
+                fmt_money(rp)
+            ));
+        }
+        if n == 0 {
+            s.push_str("No realized PnL trades recorded yet.\n");
+        }
+        Ok(s)
+    }
+
+    fn runs_table(&self) -> Result<String> {
+        let mut stmt = self.connection.prepare(
+            "SELECT id, lane, started_at, status FROM agent_runs ORDER BY rowid DESC LIMIT 60",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        let mut s = String::from("RUN ID                          LANE             STATUS\n");
+        for r in rows {
+            let (id, lane, _at, status) = r?;
+            s.push_str(&format!("{:<32} {:<16} {}\n", short_id(&id), lane, status));
+        }
+        Ok(s)
+    }
+
+    fn tool_events_table(&self) -> Result<String> {
+        let mut stmt = self.connection.prepare(
+            "SELECT run_id, tool_name, is_error FROM agent_tool_events ORDER BY rowid DESC LIMIT 60",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, bool>(2)?,
+            ))
+        })?;
+        let mut s = String::from("RUN ID                          TOOL                     ERR\n");
+        for r in rows {
+            let (id, tool, err) = r?;
+            s.push_str(&format!(
+                "{:<32} {:<24} {}\n",
+                short_id(&id),
+                tool,
+                if err { "✗" } else { "·" }
+            ));
+        }
+        Ok(s)
+    }
+
+    fn audit_table(&self) -> Result<String> {
+        let mut stmt = self.connection.prepare(
+            "SELECT recorded_at, category, action, detail_json FROM audit_events ORDER BY rowid DESC LIMIT 100",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })?;
+        let mut s = String::from("TIME                CATEGORY        ACTION\n");
+        for r in rows {
+            let (at, cat, action, detail) = r?;
+            s.push_str(&format!("{:<19} {:<15} {}\n", short_ts(&at), cat, action));
+            if let Some(d) = detail {
+                let trimmed = d.trim();
+                if !trimmed.is_empty() && trimmed != "null" {
+                    s.push_str(&format!("    {}\n", compact_detail(trimmed)));
+                }
+            }
+        }
+        Ok(s)
+    }
+
+    fn reconciliations_table(&self) -> Result<String> {
+        let mut stmt = self.connection.prepare(
+            "SELECT captured_at, status, account_count, balance_count, position_count, order_history_status FROM reconciliation_runs ORDER BY rowid DESC LIMIT 40",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })?;
+        let mut s = String::from("TIME                STATUS    ACCS  BAL  POS  ORDHIST\n");
+        for r in rows {
+            let (at, status, accs, bal, pos, ord) = r?;
+            s.push_str(&format!(
+                "{:<19} {:<9} {:<5} {:<4} {:<4} {}\n",
+                short_ts(&at),
+                status,
+                accs,
+                bal,
+                pos,
+                ord
+            ));
+        }
+        Ok(s)
+    }
+
+    fn baseline_acceptances_table(&self) -> Result<String> {
+        let mut stmt = self.connection.prepare(
+            "SELECT accepted_at, operator, reason, reconciliation_run_id FROM baseline_acceptances ORDER BY rowid DESC LIMIT 30",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+            ))
+        })?;
+        let mut s = String::from("ACCEPTED            OPERATOR  RUN  REASON\n");
+        for r in rows {
+            let (at, op, reason, run) = r?;
+            s.push_str(&format!(
+                "{:<19} {:<9} {:<4} {}\n",
+                short_ts(&at),
+                op,
+                run.map(|v| format!("{v}")).unwrap_or_else(|| "—".into()),
+                reason
+            ));
+        }
+        Ok(s)
+    }
+
+    fn simulation_table(&self) -> Result<String> {
+        let mut stmt = self.connection.prepare(
+            "SELECT id, profile, status, starting_cash_usd, final_equity_usd, realized_pnl_usd FROM paper_simulations ORDER BY rowid DESC LIMIT 20",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<f64>>(3)?,
+                row.get::<_, Option<f64>>(4)?,
+                row.get::<_, Option<f64>>(5)?,
+            ))
+        })?;
+        let mut s = String::from(
+            "SIMULATION                       PROFILE                     STATUS    START      FINAL      REALIZED\n",
+        );
+        let mut n = 0;
+        for r in rows {
+            let (id, profile, status, start, final_, realized) = r?;
+            n += 1;
+            s.push_str(&format!(
+                "{:<30} {:<28} {:<9} {:<10} {:<10} {:<10}\n",
+                short_id(&id),
+                profile,
+                status,
+                fmt_money(start),
+                fmt_money(final_),
+                fmt_money(realized)
+            ));
+        }
+        if n == 0 {
+            s.push_str("No paper simulations recorded yet.\n");
+        }
+        Ok(s)
     }
 }
 
@@ -897,6 +1416,51 @@ impl BrokerDataSink for Store {
 
 fn now() -> String {
     Utc::now().to_rfc3339()
+}
+
+fn parse_json(text: String) -> Value {
+    serde_json::from_str(&text).unwrap_or(Value::Null)
+}
+
+/// Truncate an ISO timestamp to seconds-without-timezone for compact display.
+fn short_ts(ts: &str) -> String {
+    // e.g. 2026-08-28T13:31:48.634662100+00:00 -> 2026-08-28 13:31:48
+    let body = ts.split('.').next().unwrap_or(ts);
+    body.replace('T', " ")
+}
+
+/// Shorten long IDs (like reconciliation-<timestamp>) to keep tables readable.
+fn short_id(id: &str) -> String {
+    if id.len() <= 32 {
+        id.to_owned()
+    } else {
+        format!("{}…{}", &id[..24], &id[id.len() - 6..])
+    }
+}
+
+fn fmt_money(value: Option<f64>) -> String {
+    value
+        .map(|v| format!("${v:.2}"))
+        .unwrap_or_else(|| "—".to_owned())
+}
+
+fn fmt_opt(value: Option<f64>) -> String {
+    value
+        .map(|v| format!("{v:.4}"))
+        .unwrap_or_else(|| "—".to_owned())
+}
+
+/// Collapse embedded JSON / control characters so detail lines stay on one row.
+fn compact_detail(detail: &str) -> String {
+    let collapsed = detail
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect::<String>();
+    if collapsed.len() > 160 {
+        format!("{}…", &collapsed[..160])
+    } else {
+        collapsed
+    }
 }
 
 fn ensure_column(
@@ -1417,22 +1981,9 @@ mod tests {
             raw: serde_json::Value::Null,
         };
         let coverage = BTreeMap::new();
-        let baseline = fingerprint_json(
-            &[],
-            &[record(Some(441.6712511))],
-            &[],
-            &[],
-            &[],
-            &coverage,
-        );
-        let current = fingerprint_json(
-            &[],
-            &[record(Some(441.436735))],
-            &[],
-            &[],
-            &[],
-            &coverage,
-        );
+        let baseline =
+            fingerprint_json(&[], &[record(Some(441.6712511))], &[], &[], &[], &coverage);
+        let current = fingerprint_json(&[], &[record(Some(441.436735))], &[], &[], &[], &coverage);
         // Pure mark-to-market equity movement must not read as account drift.
         let baseline_value: Value = serde_json::from_str(&baseline).unwrap();
         let current_value: Value = serde_json::from_str(&current).unwrap();

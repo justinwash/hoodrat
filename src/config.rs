@@ -537,7 +537,9 @@ impl StrategyContract {
     /// True when the operator has authorized unrestricted trading in any
     /// symbol via the "*" wildcard entry in `approved_symbols`.
     pub fn allows_any_symbol(&self) -> bool {
-        self.approved_symbols.iter().any(|symbol| symbol.trim() == "*")
+        self.approved_symbols
+            .iter()
+            .any(|symbol| symbol.trim() == "*")
     }
 
     pub fn summary(&self) -> String {
@@ -911,7 +913,11 @@ mod tests {
             },
             ..config
         });
-        assert!(report.ready, "report.ready must hold: {:?}", report.blockers);
+        assert!(
+            report.ready,
+            "report.ready must hold: {:?}",
+            report.blockers
+        );
     }
 
     #[test]
@@ -947,7 +953,11 @@ mod tests {
         assert!(config.strategy.validate_against_risk(&config.risk).is_ok());
         assert!(config.strategy.allow_leverage);
         let report = crate::readiness::check(&config);
-        assert!(report.ready, "report.ready must hold: {:?}", report.blockers);
+        assert!(
+            report.ready,
+            "report.ready must hold: {:?}",
+            report.blockers
+        );
     }
 
     #[test]
@@ -969,12 +979,13 @@ mod tests {
         config.strategy.daily_loss_limit_usd = 50_000.0;
         config.strategy.max_total_exposure_usd = 50_000.0;
         assert!(config.strategy.validate_against_risk(&config.risk).is_ok());
-        assert!(config
-            .strategy
-            .summary()
-            .contains("available_balance"));
+        assert!(config.strategy.summary().contains("available_balance"));
         let report = crate::readiness::check(&config);
-        assert!(report.ready, "report.ready must hold: {:?}", report.blockers);
+        assert!(
+            report.ready,
+            "report.ready must hold: {:?}",
+            report.blockers
+        );
     }
 
     #[test]

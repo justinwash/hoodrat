@@ -14,7 +14,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use clap::{Parser, Subcommand};
 use config::{default_config_path, Config};
-use readiness::check;
+use readiness::{check, ReadinessReport};
 use scheduler::{
     run as run_scheduler, run_from_path as run_scheduler_from_path,
     run_from_path_until as run_scheduler_from_path_until,
@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use store::Store;
+use store::{DashboardSnapshot, Store};
 
 slint::include_modules!();
 
@@ -555,22 +555,7 @@ fn dashboard(config_path: PathBuf) -> Result<()> {
     let report = check(&config);
     let snapshot = store.dashboard_snapshot(&config.storage.database_path)?;
     let window = MainWindow::new()?;
-    window.set_bot_status(if report.ready { "LIVE READY" } else { "LOCKED" }.into());
-    window.set_execution_mode(format!("mode: {:?}", config.execution.mode).into());
-    window.set_portfolio_value(format_money(snapshot.portfolio_value).into());
-    window.set_buying_power(format_money(snapshot.buying_power).into());
-    window.set_realized_pnl(format_money(snapshot.realized_pnl).into());
-    window.set_reconciliation_status(snapshot.reconciliation_status.clone().into());
-    window.set_reconciliation_details(snapshot.reconciliation_details.clone().into());
-    window.set_last_run(snapshot.last_run.into());
-    window.set_last_run_status(snapshot.last_run_status.into());
-    window.set_database_path(snapshot.database_path.into());
-    window.set_risk_status(if report.ready {
-        "Confirmed".into()
-    } else {
-        "Not confirmed / locked".into()
-    });
-    window.set_recent_events(snapshot.recent_events.into());
+    apply_snapshot(&window, &report, &config, &snapshot);
 
     let shared_store = Arc::new(Mutex::new(store));
     let refresh_window = window.as_weak();
@@ -584,29 +569,8 @@ fn dashboard(config_path: PathBuf) -> Result<()> {
             return;
         };
         if let Some(window) = refresh_window.upgrade() {
-            window.set_last_run(snapshot.last_run.into());
-            window.set_last_run_status(snapshot.last_run_status.into());
-            window.set_database_path(snapshot.database_path.into());
-            window.set_portfolio_value(format_money(snapshot.portfolio_value).into());
-            window.set_buying_power(format_money(snapshot.buying_power).into());
-            window.set_realized_pnl(format_money(snapshot.realized_pnl).into());
-            window.set_reconciliation_status(snapshot.reconciliation_status.clone().into());
-            window.set_reconciliation_details(snapshot.reconciliation_details.clone().into());
-            window.set_recent_events(snapshot.recent_events.into());
-            window.set_bot_status(
-                if check(&config).ready {
-                    "LIVE READY"
-                } else {
-                    "LOCKED"
-                }
-                .into(),
-            );
-            window.set_execution_mode(format!("mode: {:?}", config.execution.mode).into());
-            window.set_risk_status(if check(&config).ready {
-                "Confirmed".into()
-            } else {
-                "Not confirmed / locked".into()
-            });
+            let report = check(&config);
+            apply_snapshot(&window, &report, &config, &snapshot);
         }
         if let Ok(mut guard) = refresh_store.lock() {
             if let Ok(new_store) = Store::open(&config.storage.database_path) {
@@ -659,6 +623,48 @@ fn dashboard(config_path: PathBuf) -> Result<()> {
     Ok(())
 }
 
+fn apply_snapshot(
+    window: &MainWindow,
+    report: &ReadinessReport,
+    config: &Config,
+    snapshot: &DashboardSnapshot,
+) {
+    window.set_bot_status(if report.ready { "LIVE READY" } else { "LOCKED" }.into());
+    window.set_execution_mode(format!("mode: {:?}", config.execution.mode).into());
+    window.set_risk_status(if report.ready {
+        "Confirmed".into()
+    } else {
+        "Not confirmed / locked".into()
+    });
+    window.set_portfolio_value(format_money(snapshot.portfolio_value).into());
+    window.set_buying_power(format_money(snapshot.buying_power).into());
+    window.set_cash(format_money(snapshot.cash).into());
+    window.set_equity(format_money(snapshot.equity).into());
+    window.set_realized_pnl(format_money(snapshot.realized_pnl).into());
+    window.set_unrealized_pnl(format_money(snapshot.unrealized_pnl).into());
+    window.set_reconciliation_status(snapshot.reconciliation_status.clone().into());
+    window.set_reconciliation_details(snapshot.reconciliation_details.clone().into());
+    window.set_last_run(snapshot.last_run.clone().into());
+    window.set_last_run_status(snapshot.last_run_status.clone().into());
+    window.set_database_path(snapshot.database_path.clone().into());
+    window.set_recent_events(snapshot.recent_events.clone().into());
+    window.set_equity_chart_path(snapshot.equity_chart_path.clone().into());
+    window.set_equity_chart_labels(snapshot.equity_chart_labels.clone().into());
+    window.set_pnl_chart_path(snapshot.pnl_chart_path.clone().into());
+    window.set_overview_stats(snapshot.overview_stats.clone().into());
+    window.set_accounts_table(snapshot.accounts_table.clone().into());
+    window.set_balances_table(snapshot.balances_table.clone().into());
+    window.set_positions_table(snapshot.positions_table.clone().into());
+    window.set_pnl_snapshots_table(snapshot.pnl_snapshots_table.clone().into());
+    window.set_pnl_trades_table(snapshot.pnl_trades_table.clone().into());
+    window.set_runs_table(snapshot.runs_table.clone().into());
+    window.set_tool_events_table(snapshot.tool_events_table.clone().into());
+    window.set_audit_table(snapshot.audit_table.clone().into());
+    window.set_reconciliations_table(snapshot.reconciliations_table.clone().into());
+    window.set_baseline_acceptances_table(snapshot.baseline_acceptances_table.clone().into());
+    window.set_strategy_table(config.strategy.summary().into());
+    window.set_simulation_table(snapshot.simulation_table.clone().into());
+}
 fn format_money(value: Option<f64>) -> String {
     value
         .map(|value| format!("${value:.2}"))

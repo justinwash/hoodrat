@@ -175,6 +175,15 @@ Run the dashboard (monitoring only):
 cargo run -- dashboard
 ```
 
+The dashboard is a tabbed, dark terminal-style monitor (KPIs, equity/PnL
+charts, and data tables for positions, balances, returns, trades, accounts,
+runs, MCP tool events, audit trail, reconciliations, baseline acceptances,
+the strategy contract, and paper simulations). Its charts are drawn from stored
+reconciliation/ingestion history, so no extra market-data API is required.
+Note: the reconciliation `get_portfolio` read returns aggregate totals only
+(cash/buying power/equity), so the Positions tab is populated when per-symbol
+holdings are captured, rather than from the aggregate portfolio read.
+
 Run the scheduler and dashboard together in a single process (recommended for
 live operation — one command, one window, the scheduler runs in a background
 thread and stops cleanly when the window closes):
