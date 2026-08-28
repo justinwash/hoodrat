@@ -1,3 +1,4 @@
+use crate::config::StrategyContract;
 use crate::ingestion::{
     field_coverage, parse_broker_payload, AccountRecord, BalanceRecord, BrokerDataSink,
     BrokerPayload, ExecutionRecord, PnlSnapshot, PnlTradeRecord, PortfolioSnapshot, PositionRecord,
@@ -14,6 +15,8 @@ const INITIAL_MIGRATION: &str = include_str!("../migrations/001_initial.sql");
 const TOOL_EVENTS_MIGRATION: &str = include_str!("../migrations/002_tool_events.sql");
 const SCHEMA_METADATA_MIGRATION: &str = include_str!("../migrations/003_schema_metadata.sql");
 const TYPED_BROKER_MIGRATION: &str = include_str!("../migrations/004_typed_broker_ingestion.sql");
+const STRATEGY_BASELINE_MIGRATION: &str =
+    include_str!("../migrations/005_strategy_and_baseline_acceptance.sql");
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RunRecord {
@@ -25,6 +28,8 @@ pub struct RunRecord {
     pub prompt: String,
     pub raw_output: Option<String>,
     pub summary: Option<String>,
+    pub strategy_contract_version: Option<String>,
+    pub strategy_contract_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -93,6 +98,19 @@ impl Store {
         connection.execute_batch(TOOL_EVENTS_MIGRATION)?;
         connection.execute_batch(SCHEMA_METADATA_MIGRATION)?;
         connection.execute_batch(TYPED_BROKER_MIGRATION)?;
+        connection.execute_batch(STRATEGY_BASELINE_MIGRATION)?;
+        ensure_column(
+            &connection,
+            "agent_runs",
+            "strategy_contract_version",
+            "TEXT",
+        )?;
+        ensure_column(
+            &connection,
+            "agent_runs",
+            "strategy_contract_fingerprint",
+            "TEXT",
+        )?;
         if !has_column(&connection, "reconciliation_runs", "coverage_json")?
             || !has_column(&connection, "reconciliation_runs", "order_history_status")?
         {
@@ -147,10 +165,28 @@ impl Store {
         Ok(Self { connection })
     }
 
+    #[allow(dead_code)]
     pub fn begin_run(&self, id: &str, lane: &str, prompt: &str) -> Result<()> {
+        self.begin_run_with_strategy(id, lane, prompt, None)
+    }
+
+    pub fn begin_run_with_strategy(
+        &self,
+        id: &str,
+        lane: &str,
+        prompt: &str,
+        strategy: Option<&StrategyContract>,
+    ) -> Result<()> {
         self.connection.execute(
-            "INSERT INTO agent_runs (id, lane, started_at, status, prompt) VALUES (?1, ?2, ?3, 'running', ?4)",
-            params![id, lane, now(), prompt],
+            "INSERT INTO agent_runs (id, lane, started_at, status, prompt, strategy_contract_version, strategy_contract_fingerprint) VALUES (?1, ?2, ?3, 'running', ?4, ?5, ?6)",
+            params![
+                id,
+                lane,
+                now(),
+                prompt,
+                strategy.map(|value| value.contract_version.as_str()),
+                strategy.map(StrategyContract::fingerprint),
+            ],
         )?;
         Ok(())
     }
@@ -285,11 +321,22 @@ impl Store {
         let previous = self
             .connection
             .query_row(
-                "SELECT fingerprint_json FROM reconciliation_runs WHERE status = 'baseline' OR status = 'reconciled' ORDER BY id DESC LIMIT 1",
+                "SELECT accepted_fingerprint_json FROM baseline_acceptances ORDER BY id DESC LIMIT 1",
                 [],
                 |row| row.get::<_, String>(0),
             )
             .optional()?;
+        let previous = match previous {
+            Some(value) => Some(value),
+            None => self
+                .connection
+                .query_row(
+                    "SELECT fingerprint_json FROM reconciliation_runs WHERE status IN ('baseline', 'reconciled') ORDER BY id DESC LIMIT 1",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?,
+        };
         let drift = previous
             .as_deref()
             .map(|old| {
@@ -522,7 +569,7 @@ impl Store {
     pub fn latest_run(&self) -> Result<Option<RunRecord>> {
         self.connection
             .query_row(
-                "SELECT id, lane, started_at, finished_at, status, prompt, raw_output, summary FROM agent_runs ORDER BY started_at DESC LIMIT 1",
+                "SELECT id, lane, started_at, finished_at, status, prompt, raw_output, summary, strategy_contract_version, strategy_contract_fingerprint FROM agent_runs ORDER BY started_at DESC LIMIT 1",
                 [],
                 |row| {
                     Ok(RunRecord {
@@ -534,11 +581,94 @@ impl Store {
                         prompt: row.get(5)?,
                         raw_output: row.get(6)?,
                         summary: row.get(7)?,
+                        strategy_contract_version: row.get(8)?,
+                        strategy_contract_fingerprint: row.get(9)?,
                     })
                 },
             )
             .optional()
             .map_err(Into::into)
+    }
+
+    pub fn accept_latest_drift(&self, operator: &str, reason: &str, confirmed: bool) -> Result<()> {
+        if !confirmed {
+            anyhow::bail!("baseline acceptance requires --confirm");
+        }
+        if operator.trim().is_empty() {
+            anyhow::bail!("baseline acceptance requires a non-empty operator");
+        }
+        if reason.trim().is_empty() {
+            anyhow::bail!("baseline acceptance requires a non-empty reason");
+        }
+        let latest = self
+            .connection
+            .query_row(
+                "SELECT id, status, fingerprint_json FROM reconciliation_runs ORDER BY id DESC LIMIT 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+            .context("no reconciliation run is available for baseline acceptance")?;
+        if latest.1 != "drift_detected" {
+            anyhow::bail!(
+                "baseline acceptance requires the latest reconciliation to be drift_detected"
+            );
+        }
+        let already_accepted = self
+            .connection
+            .query_row(
+                "SELECT 1 FROM baseline_acceptances WHERE reconciliation_run_id = ?1 LIMIT 1",
+                params![latest.0],
+                |_row| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false);
+        if already_accepted {
+            anyhow::bail!("the latest reconciliation drift has already been accepted");
+        }
+        let prior = self
+            .connection
+            .query_row(
+                "SELECT accepted_fingerprint_json FROM baseline_acceptances ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let prior = match prior {
+            Some(value) => value,
+            None => self
+                .connection
+                .query_row(
+                    "SELECT fingerprint_json FROM reconciliation_runs WHERE id < ?1 AND status IN ('baseline', 'reconciled') ORDER BY id DESC LIMIT 1",
+                    params![latest.0],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+                .context("cannot determine the prior reconciliation fingerprint")?,
+        };
+        self.connection.execute(
+            "INSERT INTO baseline_acceptances (accepted_at, operator, reason, reconciliation_run_id, prior_fingerprint_json, accepted_fingerprint_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![now(), operator.trim(), reason.trim(), latest.0, prior, latest.2],
+        )?;
+        self.record_audit(
+            None,
+            "reconciliation",
+            "baseline_accepted",
+            &serde_json::json!({
+                "operator": operator.trim(),
+                "reason": reason.trim(),
+                "reconciliation_run_id": latest.0,
+                "prior_fingerprint": prior,
+                "accepted_fingerprint": latest.2,
+            }),
+        )?;
+        Ok(())
     }
 
     pub fn recent_events(&self, limit: u32) -> Result<Vec<AgentEventRecord>> {
@@ -869,7 +999,7 @@ mod tests {
             .record_audit(None, "test", "created", &serde_json::json!({"ok": true}))
             .unwrap();
         assert!(store.latest_run().unwrap().is_none());
-        assert_eq!(store.schema_version().unwrap(), 5);
+        assert_eq!(store.schema_version().unwrap(), 6);
     }
 
     #[test]
@@ -996,6 +1126,111 @@ mod tests {
         let incomplete = store.finalize_reconciliation(&missing).unwrap();
         assert_eq!(incomplete.status, "coverage_incomplete");
         assert_eq!(incomplete.coverage["realized_pnl"], "missing");
+    }
+
+    #[test]
+    fn accepts_drift_once_and_uses_accepted_fingerprint_as_the_new_baseline() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let mut payloads = BTreeMap::new();
+        for (tool, fixture) in [
+            (
+                "get_accounts",
+                include_str!("../tests/fixtures/get_accounts.json"),
+            ),
+            (
+                "get_portfolio",
+                include_str!("../tests/fixtures/get_portfolio.json"),
+            ),
+            (
+                "get_realized_pnl",
+                include_str!("../tests/fixtures/get_realized_pnl.json"),
+            ),
+            (
+                "get_pnl_trade_history",
+                include_str!("../tests/fixtures/get_pnl_trade_history.json"),
+            ),
+        ] {
+            let raw: Value = serde_json::from_str(fixture).unwrap();
+            store.ingest_typed_broker_payload(tool, &raw).unwrap();
+            payloads.insert(tool.to_owned(), raw);
+        }
+        store.finalize_reconciliation(&payloads).unwrap();
+        let mut changed = payloads.clone();
+        changed.insert(
+            "get_portfolio".to_owned(),
+            serde_json::json!({
+                "structuredContent": {"data": {"total_value": "1300.50", "buying_power": "50"}}
+            }),
+        );
+        let drift = store.finalize_reconciliation(&changed).unwrap();
+        assert_eq!(drift.status, "drift_detected");
+
+        assert!(store
+            .accept_latest_drift("operator-1", "reviewed balance change", true)
+            .is_ok());
+        assert!(store
+            .accept_latest_drift("operator-1", "duplicate acceptance", true)
+            .is_err());
+        let reconciled = store.finalize_reconciliation(&changed).unwrap();
+        assert_eq!(reconciled.status, "reconciled");
+
+        let acceptance_count: u32 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM baseline_acceptances", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(acceptance_count, 1);
+        let audit_count: u32 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM audit_events WHERE action = 'baseline_accepted'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(audit_count, 1);
+    }
+
+    #[test]
+    fn upgrades_schema_five_database_to_schema_six() {
+        let path = std::env::temp_dir().join(format!(
+            "hoodrat-schema-upgrade-{}-{}.db",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let _ = std::fs::remove_file(&path);
+        {
+            let connection = Connection::open(&path).unwrap();
+            connection.execute_batch(INITIAL_MIGRATION).unwrap();
+            connection.execute_batch(TOOL_EVENTS_MIGRATION).unwrap();
+            connection.execute_batch(SCHEMA_METADATA_MIGRATION).unwrap();
+            connection.execute_batch(TYPED_BROKER_MIGRATION).unwrap();
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT value FROM schema_metadata WHERE key = 'schema_version'",
+                        [],
+                        |row| row.get::<_, String>(0)
+                    )
+                    .unwrap(),
+                "5"
+            );
+        }
+        {
+            let store = Store::open(&path).unwrap();
+            assert_eq!(store.schema_version().unwrap(), 6);
+            let baseline_table_exists: u32 = store
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'baseline_acceptances'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(baseline_table_exists, 1);
+        }
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

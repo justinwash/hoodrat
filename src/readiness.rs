@@ -66,6 +66,14 @@ pub fn check(config: &Config) -> ReadinessReport {
     if config.risk.max_concurrent_positions == 0 {
         blockers.push("max concurrent positions must be greater than zero".to_owned());
     }
+    if let Err(error) = config.strategy.validate_against_risk(&config.risk) {
+        blockers.push(format!("strategy contract is invalid: {error}"));
+    }
+    if config.execution.mode == ExecutionMode::Live && !config.strategy.canary_enabled {
+        blockers.push(
+            "live execution requires the strategy canary to be explicitly enabled".to_owned(),
+        );
+    }
 
     if !config.schedule.equity_options.enabled && !config.schedule.crypto.enabled {
         notes.push("both schedule lanes are disabled".to_owned());
@@ -101,6 +109,22 @@ mod tests {
         config.execution.kill_switch_engaged = false;
         config.risk.confirmed = true;
         config.robinhood.connection_ready = true;
+        config.strategy.canary_enabled = true;
+        config.strategy.approved_symbols = vec!["BTC".to_owned()];
         assert!(check(&config).ready);
+    }
+
+    #[test]
+    fn live_mode_requires_an_explicit_strategy_canary() {
+        let mut config = Config::default();
+        config.execution.mode = ExecutionMode::Live;
+        config.execution.kill_switch_engaged = false;
+        config.risk.confirmed = true;
+        config.robinhood.connection_ready = true;
+        let report = check(&config);
+        assert!(report
+            .blockers
+            .iter()
+            .any(|item| item.contains("strategy canary")));
     }
 }

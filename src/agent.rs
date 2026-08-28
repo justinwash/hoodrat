@@ -1,4 +1,4 @@
-use crate::config::AgentConfig;
+use crate::config::{AgentConfig, RiskConfig, StrategyContract};
 use crate::ingestion::{
     parse_json_text, single_agentic_account, BrokerDataSink, BrokerPayload, ExecutionRecord,
     PortfolioSnapshot,
@@ -211,9 +211,20 @@ struct AgentTaskOptions {
     expected_mcp_server: Option<String>,
     expected_mcp_tools: Option<HashSet<String>>,
     strict_typed_ingestion: bool,
+    strategy_contract: Option<StrategyContract>,
 }
 
+#[allow(dead_code)]
 pub fn build_prompt(lane: Lane, context: &str, config_summary: &str) -> String {
+    build_prompt_with_strategy(lane, context, config_summary, &StrategyContract::default())
+}
+
+fn build_prompt_with_strategy(
+    lane: Lane,
+    context: &str,
+    config_summary: &str,
+    strategy: &StrategyContract,
+) -> String {
     format!(
         "You are the Hoodrat trading analyst for the Robinhood Agentic account.\n\n\
 Execution lane: {}. You may consider only {} in this run.\n\
@@ -227,14 +238,19 @@ tool action you took and its result. If no trade is appropriate, say so.\n\
 Preserve a machine-readable final summary using this shape when possible:\n\
 {{\"decision\":\"hold|buy|sell|reduce|close\",\"symbol\":\"...\",\"reason\":\"...\",\"risk_notes\":\"...\"}}\n\n\
 Current persisted context:\n{}\n\n\
-Configured monitoring policy (not a pre-trade firewall in direct MCP mode):\n{}",
+ |Configured monitoring policy (not a pre-trade firewall in direct MCP mode):\n{}\n\n\
+ |Strategy contract (version {}):\n{}\n\
+ |If any strategy contract condition is not satisfied, take no action and state that the run is a no-op.",
         lane.as_str(),
         lane.capabilities(),
         context,
-        config_summary
+        config_summary,
+        strategy.contract_version,
+        strategy.summary()
     )
 }
 
+#[allow(dead_code)]
 pub fn run_fresh_task(
     config: &AgentConfig,
     store: &Store,
@@ -242,16 +258,19 @@ pub fn run_fresh_task(
     context: &str,
     config_summary: &str,
 ) -> Result<AgentRunResult> {
-    run_fresh_task_with_executor(
+    run_fresh_task_with_strategy_with_executor(
         config,
         store,
         lane,
         context,
         config_summary,
+        &RiskConfig::default(),
+        &StrategyContract::default(),
         &ProcessAgentExecutor,
     )
 }
 
+#[allow(dead_code)]
 pub fn run_fresh_task_with_executor<E: AgentExecutor>(
     config: &AgentConfig,
     store: &Store,
@@ -260,7 +279,52 @@ pub fn run_fresh_task_with_executor<E: AgentExecutor>(
     config_summary: &str,
     executor: &E,
 ) -> Result<AgentRunResult> {
-    let prompt = build_prompt(lane, context, config_summary);
+    run_fresh_task_with_strategy_with_executor(
+        config,
+        store,
+        lane,
+        context,
+        config_summary,
+        &RiskConfig::default(),
+        &StrategyContract::default(),
+        executor,
+    )
+}
+
+pub fn run_fresh_task_with_strategy(
+    config: &AgentConfig,
+    store: &Store,
+    lane: Lane,
+    context: &str,
+    config_summary: &str,
+    risk: &RiskConfig,
+    strategy: &StrategyContract,
+) -> Result<AgentRunResult> {
+    run_fresh_task_with_strategy_with_executor(
+        config,
+        store,
+        lane,
+        context,
+        config_summary,
+        risk,
+        strategy,
+        &ProcessAgentExecutor,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn run_fresh_task_with_strategy_with_executor<E: AgentExecutor>(
+    config: &AgentConfig,
+    store: &Store,
+    lane: Lane,
+    context: &str,
+    config_summary: &str,
+    risk: &RiskConfig,
+    strategy: &StrategyContract,
+    executor: &E,
+) -> Result<AgentRunResult> {
+    strategy.validate_against_risk(risk)?;
+    let prompt = build_prompt_with_strategy(lane, context, config_summary, strategy);
     run_task_with_executor(
         config,
         store,
@@ -273,6 +337,7 @@ pub fn run_fresh_task_with_executor<E: AgentExecutor>(
             expected_mcp_server: None,
             expected_mcp_tools: None,
             strict_typed_ingestion: false,
+            strategy_contract: Some(strategy.clone()),
         },
         executor,
     )
@@ -296,6 +361,7 @@ pub fn run_read_only_smoke_test<E: AgentExecutor>(
             expected_mcp_server: Some(robinhood_server_name.to_owned()),
             expected_mcp_tools: Some(HashSet::from(["get_accounts".to_owned()])),
             strict_typed_ingestion: false,
+            strategy_contract: None,
         },
         executor,
     )
@@ -329,6 +395,7 @@ pub fn run_read_only_reconciliation<E: AgentExecutor>(
                 .collect(),
             ),
             strict_typed_ingestion: true,
+            strategy_contract: None,
         },
         executor,
     )
@@ -367,7 +434,19 @@ fn run_task_with_executor<E: AgentExecutor>(
     executor: &E,
 ) -> Result<AgentRunResult> {
     let run_id = format!("{}-{}", lane_label, Utc::now().format("%Y%m%dT%H%M%S%.3fZ"));
-    store.begin_run(&run_id, lane_label, &prompt)?;
+    let strategy_contract = options.strategy_contract.clone();
+    store.begin_run_with_strategy(&run_id, lane_label, &prompt, strategy_contract.as_ref())?;
+    if let Some(contract) = strategy_contract.as_ref() {
+        store.record_audit(
+            Some(&run_id),
+            "strategy",
+            "contract_bound",
+            &serde_json::json!({
+                "contract_version": contract.contract_version,
+                "contract_fingerprint": contract.fingerprint(),
+            }),
+        )?;
+    }
 
     let command = AgentCommand::from_config_with_options(
         config,

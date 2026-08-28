@@ -1,5 +1,7 @@
-use crate::agent::{run_fresh_task, run_read_only_reconciliation, Lane, ProcessAgentExecutor};
-use crate::config::Config;
+use crate::agent::{
+    run_fresh_task_with_strategy, run_read_only_reconciliation, Lane, ProcessAgentExecutor,
+};
+use crate::config::{Config, StrategyContract};
 use crate::readiness::{check, ReadinessReport};
 use crate::store::Store;
 use anyhow::{Context, Result};
@@ -212,9 +214,36 @@ fn run_due_lanes(config: &Config, store: &Store, one_shot: bool) -> Result<()> {
 }
 
 fn run_lane(config: &Config, store: &Store, lane: Lane) -> Result<()> {
+    if !strategy_allows_lane(&config.strategy, lane) {
+        store.record_audit(
+            None,
+            "scheduler",
+            "lane_skipped",
+            &serde_json::json!({
+                "lane": lane.as_str(),
+                "reason": "lane is not allowed by the strategy contract",
+                "strategy_contract_version": config.strategy.contract_version,
+                "strategy_contract_fingerprint": config.strategy.fingerprint(),
+            }),
+        )?;
+        println!(
+            "{} lane skipped: not allowed by strategy contract {}",
+            lane.as_str(),
+            config.strategy.contract_version
+        );
+        return Ok(());
+    }
     let context = build_context(store)?;
     let policy = serde_json::to_string_pretty(&config.risk)?;
-    let result = run_fresh_task(&config.agent, store, lane, &context, &policy)?;
+    let result = run_fresh_task_with_strategy(
+        &config.agent,
+        store,
+        lane,
+        &context,
+        &policy,
+        &config.risk,
+        &config.strategy,
+    )?;
     println!(
         "{} run {} finished with exit={:?}, events={}, tool_events={}",
         lane.as_str(),
@@ -224,6 +253,13 @@ fn run_lane(config: &Config, store: &Store, lane: Lane) -> Result<()> {
         result.tool_event_count,
     );
     Ok(())
+}
+
+fn strategy_allows_lane(strategy: &StrategyContract, lane: Lane) -> bool {
+    strategy
+        .allowed_lanes
+        .iter()
+        .any(|allowed_lane| allowed_lane == lane.as_str())
 }
 
 fn build_context(store: &Store) -> Result<String> {
@@ -289,5 +325,12 @@ mod tests {
         assert!(!reconciliation_status_allows_scheduler(
             "reconciliation_failed"
         ));
+    }
+
+    #[test]
+    fn strategy_contract_restricts_scheduler_lanes() {
+        let strategy = Config::default().strategy;
+        assert!(strategy_allows_lane(&strategy, Lane::Crypto));
+        assert!(!strategy_allows_lane(&strategy, Lane::EquityOptions));
     }
 }

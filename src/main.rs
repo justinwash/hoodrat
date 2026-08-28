@@ -40,6 +40,18 @@ enum CommandKind {
     SmokeTest,
     /// Run the four-tool read-only account/portfolio reconciliation.
     Reconcile,
+    /// Accept the latest detected reconciliation drift as a new operator-approved baseline.
+    AcceptBaseline {
+        /// Required acknowledgement that the latest drift was reviewed.
+        #[arg(long, required = true)]
+        confirm: bool,
+        /// Operator identity recorded in the append-only acceptance log.
+        #[arg(long, required = true)]
+        operator: String,
+        /// Human-readable reason recorded with the acceptance.
+        #[arg(long, required = true)]
+        reason: String,
+    },
     /// Run scheduled agent evaluations.
     Run {
         /// Evaluate each enabled lane once instead of running continuously.
@@ -57,6 +69,11 @@ fn main() -> Result<()> {
         CommandKind::Doctor => doctor(&cli.config),
         CommandKind::SmokeTest => smoke_test(&cli.config),
         CommandKind::Reconcile => reconcile(&cli.config),
+        CommandKind::AcceptBaseline {
+            confirm,
+            operator,
+            reason,
+        } => accept_baseline(&cli.config, confirm, &operator, &reason),
         CommandKind::Run { once } => run(cli.config, once),
         CommandKind::Dashboard => dashboard(cli.config),
     }
@@ -325,6 +342,31 @@ fn reconcile(config_path: &Path) -> Result<()> {
     {
         anyhow::bail!("Robinhood MCP reconciliation did not establish a usable baseline");
     }
+    Ok(())
+}
+
+fn accept_baseline(config_path: &Path, confirm: bool, operator: &str, reason: &str) -> Result<()> {
+    let (config, store) = load_runtime(config_path)?;
+
+    if config.execution.mode != config::ExecutionMode::Disabled {
+        anyhow::bail!("accept-baseline requires execution.mode=disabled");
+    }
+    if !config.execution.kill_switch_engaged {
+        anyhow::bail!("accept-baseline requires the kill switch to remain engaged");
+    }
+    if config.risk.confirmed {
+        anyhow::bail!("accept-baseline requires risk.confirmed=false");
+    }
+    if !config.robinhood.agentic_account_only {
+        anyhow::bail!("accept-baseline requires robinhood.agentic_account_only=true");
+    }
+
+    store.accept_latest_drift(operator, reason, confirm)?;
+    println!(
+        "accepted the latest reconciliation drift as a new baseline for operator '{}'",
+        operator.trim()
+    );
+    println!("No configuration or execution flags were changed.");
     Ok(())
 }
 

@@ -20,6 +20,20 @@ pub enum SessionMode {
     Fresh,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum OrderType {
+    #[default]
+    Limit,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SizingMode {
+    #[default]
+    FixedNotional,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default = "default_schema_version")]
@@ -34,6 +48,8 @@ pub struct Config {
     pub schedule: ScheduleConfig,
     #[serde(default)]
     pub risk: RiskConfig,
+    #[serde(default)]
+    pub strategy: StrategyContract,
     #[serde(default)]
     pub storage: StorageConfig,
     #[serde(default)]
@@ -210,6 +226,136 @@ impl Default for RiskConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StrategyContract {
+    #[serde(default = "default_strategy_contract_version")]
+    pub contract_version: String,
+    #[serde(default)]
+    pub canary_enabled: bool,
+    #[serde(default = "default_strategy_lanes")]
+    pub allowed_lanes: Vec<String>,
+    #[serde(default = "default_strategy_asset_classes")]
+    pub allowed_asset_classes: Vec<String>,
+    #[serde(default)]
+    pub approved_symbols: Vec<String>,
+    #[serde(default)]
+    pub order_type: OrderType,
+    #[serde(default)]
+    pub sizing_mode: SizingMode,
+    #[serde(default = "default_fixed_order_notional")]
+    pub fixed_order_notional_usd: f64,
+    #[serde(default = "default_strategy_max_order_notional")]
+    pub max_order_notional_usd: f64,
+    #[serde(default = "default_strategy_daily_loss_limit")]
+    pub daily_loss_limit_usd: f64,
+    #[serde(default = "default_strategy_max_total_exposure")]
+    pub max_total_exposure_usd: f64,
+    #[serde(default = "default_strategy_cooldown")]
+    pub duplicate_order_cooldown_secs: u64,
+    #[serde(default = "default_strategy_interval")]
+    pub minimum_interval_secs: u64,
+    #[serde(default)]
+    pub allow_options: bool,
+    #[serde(default)]
+    pub allow_leverage: bool,
+    #[serde(default = "default_no_op_conditions")]
+    pub no_op_conditions: Vec<String>,
+}
+
+impl Default for StrategyContract {
+    fn default() -> Self {
+        Self {
+            contract_version: default_strategy_contract_version(),
+            canary_enabled: false,
+            allowed_lanes: default_strategy_lanes(),
+            allowed_asset_classes: default_strategy_asset_classes(),
+            approved_symbols: Vec::new(),
+            order_type: OrderType::default(),
+            sizing_mode: SizingMode::default(),
+            fixed_order_notional_usd: default_fixed_order_notional(),
+            max_order_notional_usd: default_strategy_max_order_notional(),
+            daily_loss_limit_usd: default_strategy_daily_loss_limit(),
+            max_total_exposure_usd: default_strategy_max_total_exposure(),
+            duplicate_order_cooldown_secs: default_strategy_cooldown(),
+            minimum_interval_secs: default_strategy_interval(),
+            allow_options: false,
+            allow_leverage: false,
+            no_op_conditions: default_no_op_conditions(),
+        }
+    }
+}
+
+impl StrategyContract {
+    pub fn validate_against_risk(&self, risk: &RiskConfig) -> Result<()> {
+        if self.contract_version.trim().is_empty() {
+            anyhow::bail!("strategy contract version must not be empty");
+        }
+        if self.allowed_lanes.is_empty() {
+            anyhow::bail!("strategy contract must allow at least one scheduler lane");
+        }
+        if self
+            .allowed_lanes
+            .iter()
+            .any(|lane| !matches!(lane.as_str(), "crypto" | "equity_options"))
+        {
+            anyhow::bail!("strategy contract contains an unsupported scheduler lane");
+        }
+        if self.allowed_asset_classes.is_empty() {
+            anyhow::bail!("strategy contract must allow at least one asset class");
+        }
+        if self
+            .allowed_asset_classes
+            .iter()
+            .any(|asset_class| !matches!(asset_class.as_str(), "crypto" | "equity"))
+        {
+            anyhow::bail!("strategy contract contains an unsupported asset class");
+        }
+        if self.canary_enabled && self.approved_symbols.is_empty() {
+            anyhow::bail!("enabled strategy canary requires at least one approved symbol");
+        }
+        if self.allow_options {
+            anyhow::bail!("strategy contract must forbid options in the initial canary");
+        }
+        if self.allow_leverage {
+            anyhow::bail!("strategy contract must forbid leverage in the initial canary");
+        }
+        if self.fixed_order_notional_usd <= 0.0
+            || self.max_order_notional_usd <= 0.0
+            || self.daily_loss_limit_usd <= 0.0
+            || self.max_total_exposure_usd <= 0.0
+        {
+            anyhow::bail!("strategy contract monetary limits must be greater than zero");
+        }
+        if self.fixed_order_notional_usd > self.max_order_notional_usd {
+            anyhow::bail!("fixed strategy order notional exceeds the strategy order cap");
+        }
+        if self.minimum_interval_secs == 0 || self.duplicate_order_cooldown_secs == 0 {
+            anyhow::bail!("strategy timing limits must be greater than zero");
+        }
+        if self.max_order_notional_usd > risk.max_order_notional_usd {
+            anyhow::bail!("strategy order cap exceeds the configured risk order cap");
+        }
+        if self.daily_loss_limit_usd > risk.daily_loss_limit_usd {
+            anyhow::bail!("strategy daily loss limit exceeds the configured risk limit");
+        }
+        if self.max_total_exposure_usd > risk.max_total_exposure_usd {
+            anyhow::bail!("strategy exposure cap exceeds the configured risk limit");
+        }
+        if self.duplicate_order_cooldown_secs < risk.duplicate_order_cooldown_secs {
+            anyhow::bail!("strategy duplicate cooldown is less conservative than risk policy");
+        }
+        Ok(())
+    }
+
+    pub fn fingerprint(&self) -> String {
+        serde_json::to_string(self).expect("strategy contract serialization cannot fail")
+    }
+
+    pub fn summary(&self) -> String {
+        serde_json::to_string_pretty(self).expect("strategy contract serialization cannot fail")
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageConfig {
     #[serde(default = "default_database_path")]
     pub database_path: PathBuf,
@@ -246,6 +392,7 @@ impl Default for Config {
             robinhood: RobinhoodConfig::default(),
             schedule: ScheduleConfig::default(),
             risk: RiskConfig::default(),
+            strategy: StrategyContract::default(),
             storage: StorageConfig::default(),
             ui: UiConfig::default(),
         }
@@ -390,6 +537,42 @@ fn default_max_quote_age() -> u64 {
 fn default_duplicate_cooldown() -> u64 {
     60
 }
+fn default_strategy_contract_version() -> String {
+    "canary-v1".to_owned()
+}
+fn default_strategy_lanes() -> Vec<String> {
+    vec!["crypto".to_owned()]
+}
+fn default_strategy_asset_classes() -> Vec<String> {
+    vec!["crypto".to_owned()]
+}
+fn default_fixed_order_notional() -> f64 {
+    25.0
+}
+fn default_strategy_max_order_notional() -> f64 {
+    25.0
+}
+fn default_strategy_daily_loss_limit() -> f64 {
+    25.0
+}
+fn default_strategy_max_total_exposure() -> f64 {
+    100.0
+}
+fn default_strategy_cooldown() -> u64 {
+    3_600
+}
+fn default_strategy_interval() -> u64 {
+    900
+}
+fn default_no_op_conditions() -> Vec<String> {
+    vec![
+        "no approved symbol or asset class match".to_owned(),
+        "quote is missing, stale, or outside the spread policy".to_owned(),
+        "daily loss, exposure, position, or notional limit would be exceeded".to_owned(),
+        "duplicate-order cooldown or ambiguous prior run is active".to_owned(),
+        "any unexpected tool, MCP error, reconciliation drift, or failed audit".to_owned(),
+    ]
+}
 fn default_database_path() -> PathBuf {
     PathBuf::from("data/hoodrat.db")
 }
@@ -409,6 +592,9 @@ mod tests {
         assert!(!config.risk.confirmed);
         assert!(!config.robinhood.connection_ready);
         assert_eq!(config.agent.session_mode, SessionMode::Fresh);
+        assert!(!config.strategy.canary_enabled);
+        assert!(!config.strategy.allow_options);
+        assert!(!config.strategy.allow_leverage);
     }
 
     #[test]
@@ -418,6 +604,44 @@ mod tests {
         assert_eq!(decoded.schema_version, 1);
         assert_eq!(decoded.agent.model, "gpt-5.6-luna");
         assert_eq!(decoded.agent.provider, "openrouter");
+        assert_eq!(decoded.strategy.contract_version, "canary-v1");
+        assert_eq!(decoded.strategy.order_type, OrderType::Limit);
+    }
+
+    #[test]
+    fn default_strategy_contract_is_conservative_and_valid() {
+        let config = Config::default();
+        config.strategy.validate_against_risk(&config.risk).unwrap();
+        assert_eq!(config.strategy.allowed_lanes, vec!["crypto"]);
+        assert!(config.strategy.approved_symbols.is_empty());
+        assert_eq!(config.strategy.fixed_order_notional_usd, 25.0);
+        assert!(config.strategy.fingerprint().contains("canary-v1"));
+    }
+
+    #[test]
+    fn strategy_contract_rejects_unsafe_or_overbroad_changes() {
+        let config = Config::default();
+        let mut strategy = config.strategy.clone();
+        strategy.allow_options = true;
+        assert!(strategy.validate_against_risk(&config.risk).is_err());
+
+        strategy = config.strategy.clone();
+        strategy.max_order_notional_usd = config.risk.max_order_notional_usd + 1.0;
+        assert!(strategy.validate_against_risk(&config.risk).is_err());
+
+        strategy = config.strategy;
+        strategy.canary_enabled = true;
+        assert!(strategy
+            .validate_against_risk(&RiskConfig::default())
+            .is_err());
+    }
+
+    #[test]
+    fn strategy_fingerprint_changes_when_contract_changes() {
+        let first = StrategyContract::default();
+        let mut second = first.clone();
+        second.fixed_order_notional_usd += 1.0;
+        assert_ne!(first.fingerprint(), second.fingerprint());
     }
 
     #[test]

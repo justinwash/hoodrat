@@ -69,6 +69,8 @@ The default config is intentionally locked:
 - kill switch: engaged
 - risk policy: unconfirmed
 - Robinhood connection: not marked ready
+- strategy canary: disabled
+- strategy scope: crypto lane only, limit orders, no options, no leverage
 
 Configure Cline and Robinhood MCP. Robinhood's documented MCP endpoint is:
 
@@ -144,6 +146,21 @@ identifiers on dependent reads. Any missing read, duplicate read, MCP error,
 typed parsing error, wrong-account read, or non-Robinhood tool use blocks
 reconciliation.
 
+If a reconciliation reports `drift_detected`, do not silently overwrite the
+baseline. An operator must review the balance or account change and explicitly
+accept that exact latest run:
+
+```text
+cargo run -- accept-baseline --confirm --operator "<operator-id>" --reason "<reviewed reason>"
+```
+
+Acceptance is available only while execution remains disabled, the kill switch
+is engaged, risk is unconfirmed, and the Agentic-account-only restriction is
+enabled. Each acceptance is append-only and records the operator, reason,
+reconciliation run, prior fingerprint, and accepted fingerprint. The command
+does not change configuration, enable live execution, or place an order. Do not
+run it until the operator has reviewed and approved the detected change.
+
 Robinhood's current Trading MCP documentation describes transaction and order
 history as readable account data, but does not document a dedicated
 order-history MCP tool. Hoodrat therefore records full order-history coverage
@@ -185,6 +202,17 @@ The live readiness gate requires all of the following:
 2. `execution.kill_switch_engaged` is `false`.
 3. `risk.confirmed` is `true`.
 4. `robinhood.connection_ready` is `true`.
+5. `strategy.canary_enabled` is `true`.
+
+The initial strategy contract is intentionally narrower than the general
+capability model: it permits only the `crypto` lane and `crypto` asset class,
+uses fixed small notional limit orders, forbids options and leverage, and
+requires an explicit approved-symbol list when enabled. Its limits must be no
+looser than the configured risk policy. Any contract violation, stale or
+ambiguous data, reconciliation drift, unexpected tool, or other no-op condition
+must result in no action. The strategy contract is guidance bound to the prompt
+and audit record; under the direct Cline-to-Robinhood architecture it is not a
+deterministic pre-trade firewall.
 
 The initial moderate risk values are placeholders for development. They must
 be reviewed and explicitly confirmed before live mode is considered ready.
@@ -202,6 +230,8 @@ The database defaults to `data/hoodrat.db`. It contains:
 - typed broker accounts, balances, positions, realized PnL snapshots, and PnL trade history;
 - reconciliation runs, raw read payloads, stable fingerprints, categorized drift,
   response coverage, and order-history coverage status;
+- append-only operator baseline-acceptance records with prior and accepted
+  fingerprints;
 - schema version metadata.
 
 No API keys or Robinhood credentials belong in `hoodrat.json` or SQLite. Keep

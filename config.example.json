@@ -46,6 +46,34 @@
     "max_quote_age_secs": 30,
     "duplicate_order_cooldown_secs": 60
   },
+  "strategy": {
+    "contract_version": "canary-v1",
+    "canary_enabled": false,
+    "allowed_lanes": [
+      "crypto"
+    ],
+    "allowed_asset_classes": [
+      "crypto"
+    ],
+    "approved_symbols": [],
+    "order_type": "limit",
+    "sizing_mode": "fixed_notional",
+    "fixed_order_notional_usd": 25.0,
+    "max_order_notional_usd": 25.0,
+    "daily_loss_limit_usd": 25.0,
+    "max_total_exposure_usd": 100.0,
+    "duplicate_order_cooldown_secs": 3600,
+    "minimum_interval_secs": 900,
+    "allow_options": false,
+    "allow_leverage": false,
+    "no_op_conditions": [
+      "no approved symbol or asset class match",
+      "quote is missing, stale, or outside the spread policy",
+      "daily loss, exposure, position, or notional limit would be exceeded",
+      "duplicate-order cooldown or ambiguous prior run is active",
+      "any unexpected tool, MCP error, reconciliation drift, or failed audit"
+    ]
+  },
   "storage": {
     "database_path": "data/hoodrat.db"
   },
