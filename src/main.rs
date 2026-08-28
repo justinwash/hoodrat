@@ -15,10 +15,15 @@ use chrono::Utc;
 use clap::{Parser, Subcommand};
 use config::{default_config_path, Config};
 use readiness::check;
-use scheduler::{run as run_scheduler, run_from_path as run_scheduler_from_path};
+use scheduler::{
+    run as run_scheduler, run_from_path as run_scheduler_from_path,
+    run_from_path_until as run_scheduler_from_path_until,
+};
 use simulator::{simulate as run_paper_simulation, MarketPlan};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread;
 use store::Store;
 
 slint::include_modules!();
@@ -68,6 +73,8 @@ enum CommandKind {
         #[arg(long)]
         once: bool,
     },
+    /// Run the scheduler and the monitoring dashboard together in one process.
+    App,
     /// Open the local Slint monitoring dashboard.
     Dashboard,
 }
@@ -87,6 +94,7 @@ fn main() -> Result<()> {
             reason,
         } => accept_baseline(&cli.config, confirm, &operator, &reason),
         CommandKind::Run { once } => run(cli.config, once),
+        CommandKind::App => app(cli.config),
         CommandKind::Dashboard => dashboard(cli.config),
     }
 }
@@ -521,6 +529,25 @@ fn accept_baseline(config_path: &Path, confirm: bool, operator: &str, reason: &s
 
 fn run(config_path: PathBuf, once: bool) -> Result<()> {
     run_scheduler_from_path(&config_path, once)
+}
+
+fn app(config_path: PathBuf) -> Result<()> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let scheduler_path = config_path.clone();
+    let scheduler_stop = Arc::clone(&stop);
+    let scheduler = thread::spawn(move || {
+        if let Err(error) = run_scheduler_from_path_until(&scheduler_path, scheduler_stop) {
+            eprintln!("scheduler thread exited with error: {error:#}");
+        }
+    });
+
+    let dashboard_result = dashboard(config_path);
+
+    // Request the scheduler loop to stop, then wait for it to wind down so the
+    // process exits cleanly after the dashboard window closes.
+    stop.store(true, Ordering::Relaxed);
+    let _ = scheduler.join();
+    dashboard_result
 }
 
 fn dashboard(config_path: PathBuf) -> Result<()> {

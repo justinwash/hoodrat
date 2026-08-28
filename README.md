@@ -169,13 +169,21 @@ as `not_documented` and does not invent or call an unsupported tool. The
 documented `get_pnl_trade_history` read is persisted separately as realized-PnL
 trade history.
 
-Run the dashboard:
+Run the dashboard (monitoring only):
 
 ```text
 cargo run -- dashboard
 ```
 
-Run the scheduler in its current safe mode:
+Run the scheduler and dashboard together in a single process (recommended for
+live operation — one command, one window, the scheduler runs in a background
+thread and stops cleanly when the window closes):
+
+```text
+cargo run -- app
+```
+
+Run the scheduler headlessly in its current safe mode:
 
 ```text
 cargo run -- run

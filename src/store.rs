@@ -96,6 +96,10 @@ impl Store {
         let connection = Connection::open(path)
             .with_context(|| format!("failed to open database at {}", path.display()))?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
+        // Allow concurrent readers/writers (scheduler thread + dashboard in the
+        // same process, or a separate dashboard process) to wait briefly for a
+        // lock instead of failing immediately with "database is locked".
+        connection.pragma_update(None, "busy_timeout", 5_000)?;
         connection.execute_batch(INITIAL_MIGRATION)?;
         connection.execute_batch(TOOL_EVENTS_MIGRATION)?;
         connection.execute_batch(SCHEMA_METADATA_MIGRATION)?;

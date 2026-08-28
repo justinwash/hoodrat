@@ -9,6 +9,8 @@ use chrono::{Local, NaiveTime, Utc};
 use chrono_tz::Tz;
 use std::path::Path;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -57,6 +59,17 @@ pub fn run(config: &Config, store: &Store, once: bool) -> Result<()> {
 }
 
 pub fn run_from_path(config_path: &Path, once: bool) -> Result<()> {
+    run_loop(config_path, once, Arc::new(AtomicBool::new(false)))
+}
+
+/// Run the continuous scheduler until `stop` is set to true. Used by the
+/// combined dashboard+scheduler process mode so the GUI process can shut the
+/// loop down cleanly when its window closes.
+pub fn run_from_path_until(config_path: &Path, stop: Arc<AtomicBool>) -> Result<()> {
+    run_loop(config_path, false, stop)
+}
+
+fn run_loop(config_path: &Path, once: bool, stop: Arc<AtomicBool>) -> Result<()> {
     let mut config = load_config(config_path)?;
     let mut database_path = config.storage.database_path.clone();
     let mut store = Store::open(&database_path)?;
@@ -71,6 +84,9 @@ pub fn run_from_path(config_path: &Path, once: bool) -> Result<()> {
     let mut reconciliation_ready: Option<bool> = None;
 
     loop {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
         config = load_config(config_path)?;
         if config.storage.database_path != database_path {
             database_path = config.storage.database_path.clone();
@@ -117,6 +133,7 @@ pub fn run_from_path(config_path: &Path, once: bool) -> Result<()> {
         }
         thread::sleep(Duration::from_secs(1));
     }
+    Ok(())
 }
 
 fn run_startup_reconciliation(config: &Config, store: &Store) -> Result<bool> {
