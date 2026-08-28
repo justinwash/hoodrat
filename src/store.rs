@@ -3,6 +3,7 @@ use crate::ingestion::{
     field_coverage, parse_broker_payload, AccountRecord, BalanceRecord, BrokerDataSink,
     BrokerPayload, ExecutionRecord, PnlSnapshot, PnlTradeRecord, PortfolioSnapshot, PositionRecord,
 };
+use crate::simulator::PaperSimulation;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -17,6 +18,7 @@ const SCHEMA_METADATA_MIGRATION: &str = include_str!("../migrations/003_schema_m
 const TYPED_BROKER_MIGRATION: &str = include_str!("../migrations/004_typed_broker_ingestion.sql");
 const STRATEGY_BASELINE_MIGRATION: &str =
     include_str!("../migrations/005_strategy_and_baseline_acceptance.sql");
+const PAPER_SIMULATIONS_MIGRATION: &str = include_str!("../migrations/006_paper_simulations.sql");
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RunRecord {
@@ -99,6 +101,7 @@ impl Store {
         connection.execute_batch(SCHEMA_METADATA_MIGRATION)?;
         connection.execute_batch(TYPED_BROKER_MIGRATION)?;
         connection.execute_batch(STRATEGY_BASELINE_MIGRATION)?;
+        connection.execute_batch(PAPER_SIMULATIONS_MIGRATION)?;
         ensure_column(
             &connection,
             "agent_runs",
@@ -739,6 +742,84 @@ impl Store {
             .context("schema version is not an unsigned integer")
     }
 
+    pub fn record_paper_simulation(&self, simulation: &PaperSimulation) -> Result<()> {
+        self.connection.execute(
+            "INSERT INTO paper_simulations (id, started_at, finished_at, profile, status, starting_cash_usd, final_cash_usd, final_equity_usd, realized_pnl_usd, unrealized_pnl_usd, market_snapshot_json, result_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                simulation.id,
+                simulation.started_at,
+                simulation.finished_at,
+                simulation.profile,
+                simulation.status,
+                simulation.starting_cash_usd,
+                simulation.final_cash_usd,
+                simulation.final_equity_usd,
+                simulation.realized_pnl_usd,
+                simulation.unrealized_pnl_usd,
+                serde_json::to_string(&simulation.market_plan)?,
+                serde_json::to_string(simulation)?,
+            ],
+        )?;
+        for event in &simulation.events {
+            self.connection.execute(
+                "INSERT INTO paper_simulation_events (simulation_id, event_at, event_type, symbol, asset_class, side, quantity, price, notional_usd, fee_usd, realized_pnl_usd, details_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                params![
+                    simulation.id,
+                    event.event_at,
+                    event.event_type,
+                    event.symbol,
+                    event.asset_class,
+                    event.side,
+                    event.quantity,
+                    event.price,
+                    event.notional_usd,
+                    event.fee_usd,
+                    event.realized_pnl_usd,
+                    serde_json::to_string(&serde_json::json!({"details": event.details}))?,
+                ],
+            )?;
+        }
+        for position in &simulation.positions {
+            self.connection.execute(
+                "INSERT INTO paper_simulation_positions (simulation_id, position_key, symbol, asset_class, quantity, average_entry_price, mark_price, market_value_usd, unrealized_pnl_usd, opened_at, underlying, option_type, strike, expiration, multiplier) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                params![
+                    simulation.id,
+                    position.position_key,
+                    position.symbol,
+                    position.asset_class,
+                    position.quantity,
+                    position.average_entry_price,
+                    position.mark_price,
+                    position.market_value_usd,
+                    position.unrealized_pnl_usd,
+                    position.opened_at,
+                    position.underlying,
+                    position.option_type.as_ref().map(|value| match value {
+                        crate::simulator::OptionType::Call => "call",
+                        crate::simulator::OptionType::Put => "put",
+                    }),
+                    position.strike,
+                    position.expiration,
+                    position.multiplier,
+                ],
+            )?;
+        }
+        self.record_audit(
+            None,
+            "paper_simulation",
+            "completed",
+            &serde_json::json!({
+                "simulation_id": simulation.id,
+                "profile": simulation.profile,
+                "status": simulation.status,
+                "event_count": simulation.events.len(),
+                "position_count": simulation.positions.len(),
+                "final_equity_usd": simulation.final_equity_usd,
+            }),
+        )?;
+        Ok(())
+    }
+
     pub fn dashboard_snapshot(&self, database_path: &Path) -> Result<DashboardSnapshot> {
         let latest = self.latest_run()?;
         let events = self.recent_events(12)?;
@@ -999,13 +1080,15 @@ mod tests {
             .record_audit(None, "test", "created", &serde_json::json!({"ok": true}))
             .unwrap();
         assert!(store.latest_run().unwrap().is_none());
-        assert_eq!(store.schema_version().unwrap(), 6);
+        assert_eq!(store.schema_version().unwrap(), 7);
     }
 
     #[test]
     fn records_and_reads_run_events_and_tool_events() {
         let store = Store::open(Path::new(":memory:")).unwrap();
-        store.begin_run("run-1", "crypto", "prompt").unwrap();
+        store
+            .begin_run("run-1", "equity_options", "prompt")
+            .unwrap();
         store
             .record_agent_event(&AgentEventRecord {
                 run_id: "run-1".to_owned(),
@@ -1030,7 +1113,78 @@ mod tests {
         assert_eq!(store.recent_events(5).unwrap().len(), 1);
         assert_eq!(store.tool_event_count("run-1").unwrap(), 1);
         assert_eq!(store.tool_event_error_count("run-1").unwrap(), 0);
-        assert_eq!(store.latest_run().unwrap().unwrap().lane, "crypto");
+        assert_eq!(store.latest_run().unwrap().unwrap().lane, "equity_options");
+    }
+
+    #[test]
+    fn persists_paper_simulation_events_and_positions() {
+        let store = Store::open(Path::new(":memory:")).unwrap();
+        let config = crate::config::SimulationConfig {
+            enabled: true,
+            max_quote_age_secs: 120,
+            ..crate::config::SimulationConfig::default()
+        };
+        let now = "2026-08-27T12:00:00Z".parse().unwrap();
+        let simulation = crate::simulator::simulate(
+            crate::simulator::MarketPlan {
+                captured_at: Some("2026-08-27T11:59:30Z".to_owned()),
+                quotes: vec![crate::simulator::MarketQuote {
+                    symbol: "SPY".to_owned(),
+                    asset_class: crate::simulator::AssetClass::Equity,
+                    bid: Some(499.9),
+                    ask: Some(500.1),
+                    last: Some(500.0),
+                    as_of: Some("2026-08-27T11:59:30Z".to_owned()),
+                    underlying: None,
+                    option_type: None,
+                    strike: None,
+                    expiration: None,
+                    multiplier: None,
+                }],
+                proposals: vec![crate::simulator::TradeProposal {
+                    action: "buy".to_owned(),
+                    symbol: "SPY".to_owned(),
+                    asset_class: crate::simulator::AssetClass::Equity,
+                    quantity: 1.0,
+                    limit_price: None,
+                    underlying: None,
+                    option_type: None,
+                    strike: None,
+                    expiration: None,
+                    multiplier: None,
+                    reason: Some("persistence test".to_owned()),
+                }],
+            },
+            &config,
+            now,
+        )
+        .unwrap();
+        store.record_paper_simulation(&simulation).unwrap();
+        let simulation_count: u32 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM paper_simulations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let event_count: u32 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM paper_simulation_events WHERE simulation_id = ?1",
+                params![simulation.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let position_count: u32 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM paper_simulation_positions WHERE simulation_id = ?1",
+                params![simulation.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(simulation_count, 1);
+        assert_eq!(event_count, 1);
+        assert_eq!(position_count, 1);
     }
 
     #[test]
@@ -1193,7 +1347,7 @@ mod tests {
     }
 
     #[test]
-    fn upgrades_schema_five_database_to_schema_six() {
+    fn upgrades_schema_five_database_to_schema_seven() {
         let path = std::env::temp_dir().join(format!(
             "hoodrat-schema-upgrade-{}-{}.db",
             std::process::id(),
@@ -1219,7 +1373,7 @@ mod tests {
         }
         {
             let store = Store::open(&path).unwrap();
-            assert_eq!(store.schema_version().unwrap(), 6);
+            assert_eq!(store.schema_version().unwrap(), 7);
             let baseline_table_exists: u32 = store
                 .connection
                 .query_row(
@@ -1229,8 +1383,66 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(baseline_table_exists, 1);
+            let paper_table_exists: u32 = store
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'paper_simulations'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(paper_table_exists, 1);
         }
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn ignores_volatile_equity_marks_when_comparing_balance_fingerprints() {
+        use crate::ingestion::BalanceRecord;
+        use std::collections::BTreeMap;
+
+        let record = |equity: Option<f64>| BalanceRecord {
+            captured_at: "2026-08-28T12:00:00Z".to_owned(),
+            account_number: Some("account-1".to_owned()),
+            cash_usd: Some(35.15),
+            buying_power_usd: Some(35.15),
+            unleveraged_buying_power_usd: Some(35.15),
+            equity_usd: equity,
+            margin_used_usd: None,
+            unsettled_funds_usd: Some(0.0),
+            raw: serde_json::Value::Null,
+        };
+        let coverage = BTreeMap::new();
+        let baseline = fingerprint_json(
+            &[],
+            &[record(Some(441.6712511))],
+            &[],
+            &[],
+            &[],
+            &coverage,
+        );
+        let current = fingerprint_json(
+            &[],
+            &[record(Some(441.436735))],
+            &[],
+            &[],
+            &[],
+            &coverage,
+        );
+        // Pure mark-to-market equity movement must not read as account drift.
+        let baseline_value: Value = serde_json::from_str(&baseline).unwrap();
+        let current_value: Value = serde_json::from_str(&current).unwrap();
+        assert!(drift_categories(&baseline_value, &current_value).is_empty());
+
+        // A real balance movement (cash settling) must still flag as drift.
+        let cash_record = BalanceRecord {
+            cash_usd: Some(35.0),
+            ..record(Some(441.436735))
+        };
+        let settled = fingerprint_json(&[], &[cash_record], &[], &[], &[], &coverage);
+        let settled_value: Value = serde_json::from_str(&settled).unwrap();
+        assert!(drift_categories(&current_value, &settled_value)
+            .contains(&"balances_changed".to_owned()));
     }
 
     #[test]
@@ -1300,12 +1512,19 @@ fn fingerprint_json(
     let mut balance_values = balances
         .iter()
         .map(|balance| {
+            // Note: equity_usd is intentionally excluded from the fingerprint.
+            // It is a pure mark-to-market figure (cash + live position value at
+            // snapshot time) that ticks with every price move, so including it
+            // makes intraday re-start reconciliations read as "balances_changed"
+            // on a few-cent mark wobble. Real account movement (cash, buying
+            // power, unsettled funds, margin used) is still fingerprinted. This
+            // mirrors the existing volatile-field normalization applied to
+            // pnl_snapshots (operator-approved for live standing-bot runs).
             serde_json::json!({
                 "account_number": balance.account_number,
                 "cash_usd": balance.cash_usd,
                 "buying_power_usd": balance.buying_power_usd,
                 "unleveraged_buying_power_usd": balance.unleveraged_buying_power_usd,
-                "equity_usd": balance.equity_usd,
                 "margin_used_usd": balance.margin_used_usd,
                 "unsettled_funds_usd": balance.unsettled_funds_usd,
             })

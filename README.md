@@ -32,10 +32,9 @@ Robinhood Trading MCP (direct, HTTPS)
 Every scheduled task is isolated. Continuity comes from a context packet built
 by Rust from persisted state, not from a long-lived Cline conversation.
 
-The scaffold has separate equity/options and crypto schedule lanes. The
-capability model includes equities, options, and crypto because those are the
-categories Robinhood currently documents for Agentic Trading. The config keeps
-per-lane switches so they can be disabled independently.
+The active scaffold has one equity/options schedule lane. Its capability model,
+risk policy, strategy contract, and simulator are all limited to equities and
+options.
 
 ## Prerequisites
 
@@ -70,7 +69,7 @@ The default config is intentionally locked:
 - risk policy: unconfirmed
 - Robinhood connection: not marked ready
 - strategy canary: disabled
-- strategy scope: crypto lane only, limit orders, no options, no leverage
+- strategy scope: equity/options lane, limit orders, no leverage
 
 Configure Cline and Robinhood MCP. Robinhood's documented MCP endpoint is:
 
@@ -116,8 +115,10 @@ cargo run -- smoke-test
 This command is separate from scheduled execution. It requires the application
 to remain disabled, the kill switch to remain engaged, and the risk policy to
 remain unconfirmed. It launches Cline with `--plan`, `--json`, `--auto-approve true`,
-and `--retries 1`, records the result in SQLite, and does not change the
-configuration. Auto-approval is required for Cline's headless MCP call to run;
+and `--retries 1`, launches Cline with its isolated data directory and a
+deny-all `CLINE_COMMAND_PERMISSIONS` defense-in-depth policy, records the result
+in SQLite, and does not change the configuration. Auto-approval is required for
+Cline's headless MCP call to run;
 the smoke-test system prompt permits only the single read-only `get_accounts`
 probe, and the supervisor requires that successful read to be the only tool
 call observed. A successful Cline exit alone is not sufficient. Plan mode and
@@ -205,17 +206,73 @@ The live readiness gate requires all of the following:
 5. `strategy.canary_enabled` is `true`.
 
 The initial strategy contract is intentionally narrower than the general
-capability model: it permits only the `crypto` lane and `crypto` asset class,
-uses fixed small notional limit orders, forbids options and leverage, and
-requires an explicit approved-symbol list when enabled. Its limits must be no
-looser than the configured risk policy. Any contract violation, stale or
-ambiguous data, reconciliation drift, unexpected tool, or other no-op condition
-must result in no action. The strategy contract is guidance bound to the prompt
-and audit record; under the direct Cline-to-Robinhood architecture it is not a
-deterministic pre-trade firewall.
+capability model: it permits only the `equity_options` lane and `equity`/`option`
+asset classes, uses fixed small notional limit orders, permits options, forbids
+leverage, and requires an explicit approved-symbol list when enabled. Its limits
+must be no looser than the configured risk policy. Any contract violation, stale
+or ambiguous data, reconciliation drift, unexpected tool, or other no-op
+condition must result in no action. The strategy contract is guidance bound to
+the prompt and audit record; under the direct Cline-to-Robinhood architecture it
+is not a deterministic pre-trade firewall.
 
 The initial moderate risk values are placeholders for development. They must
 be reviewed and explicitly confirmed before live mode is considered ready.
+
+## Read-only live-data paper simulation
+
+The repository also includes a separate simulation-only harness. It uses a
+fresh Cline task to call configured read-only `get_*` MCP tools. Hoodrat
+persists each raw successful MCP response in the local SQLite tool-event store
+and normalizes quote fields in Rust; the agent is allowed to return only a
+paper-proposals envelope and is not trusted to supply prices or timestamps.
+The simulator never sends an order, watchlist update, account change, or other
+write to Robinhood.
+
+Enable it in a non-live configuration by setting `simulation.enabled` to
+`true`, reviewing the configured `market_data_tools` and `symbols`, and then
+run:
+
+```text
+cargo run -- --config simulation.json market-probe
+cargo run -- --config simulation.json simulate
+```
+
+Run `market-probe` first. It calls every configured market-data tool exactly
+once, persists the raw responses, and prints only redacted response shapes and
+field paths. It is the schema-discovery step; do not run `simulate` until the
+probe confirms the actual tool names and quote fields.
+
+The command remains fail-closed unless all of the following are true:
+
+- `execution.mode` is `disabled`;
+- `execution.kill_switch_engaged` is `true`;
+- `risk.confirmed` is `false`;
+- `robinhood.agentic_account_only` is `true`;
+- every configured market-data tool is a read-only `get_*` tool;
+- the Cline task calls each configured market-data tool exactly once, without
+  MCP errors or unexpected tools; and
+- successful raw MCP output contains current quote fields with fresh RFC3339
+  timestamps and valid quote shape.
+
+The default `aggressive-any-risk-sim-v1` profile supports equities, short
+positions, leverage, and options limited to 0–1 DTE. Its slippage, fees,
+gross exposure, leverage, position-count, and holding-period limits still
+apply. “Aggressive” changes only the local paper engine; it cannot enable live
+execution or override the live strategy contract.
+
+The isolated simulation is currently equity/options-only. It uses Robinhood's
+documented read-only endpoints: `get_equity_quotes`, `get_option_chains`,
+`get_option_instruments`, and `get_option_quotes`. The option flow is
+dependency-ordered: a returned chain ID is passed to instrument discovery, and
+only returned instrument IDs are passed to quote retrieval. Historical bars from
+`get_equity_historicals` and `get_option_historicals` are never treated as
+current executable quotes.
+
+The `market-probe` command still verifies that the connected MCP profile exposes
+each configured endpoint and that its raw fields are usable before simulation.
+Missing, stale, ambiguous, inactive, unsupported, or dependency-incomplete raw
+data prevents simulation rather than producing paper fills. No live simulation
+has been run as part of repository validation.
 
 ## SQLite state
 
@@ -232,6 +289,8 @@ The database defaults to `data/hoodrat.db`. It contains:
   response coverage, and order-history coverage status;
 - append-only operator baseline-acceptance records with prior and accepted
   fingerprints;
+- paper simulations, their timestamped market snapshots, simulated fills and
+  option-expiry settlements, and final simulated positions;
 - schema version metadata.
 
 No API keys or Robinhood credentials belong in `hoodrat.json` or SQLite. Keep
@@ -253,6 +312,16 @@ store where applicable.
   execution guarantee.
 - No strategy recommends a symbol or trade. The strategy prompt is deliberately
   conservative and asks Cline to retrieve current data before acting.
+- `simulation.json` is configured with Robinhood's documented
+  equity/options read endpoints. The configuration remains unusable until the
+  configured reads pass the exact-once, no-error probe and produce fresh
+  normalized quotes. Downstream option reads require returned chain and
+  instrument IDs; unjoined or stale option quotes are rejected.
+- `simulate` does not trust model-transformed prices: its Rust normalizer
+  requires symbol, price, and timestamp fields in the raw MCP response.
+- A single snapshot validates plumbing, not strategy performance. Use repeated
+  snapshots or historical data for evaluation, and do not treat historical
+  candles as current executable quotes.
 
 ## Tests
 

@@ -71,7 +71,7 @@
     ]
   },
   "simulation": {
-    "enabled": false,
+    "enabled": true,
     "market_data_tools": [
       "get_equity_quotes",
       "get_option_chains",
@@ -101,7 +101,7 @@
     }
   },
   "storage": {
-    "database_path": "data/hoodrat.db"
+    "database_path": "data/hoodrat-simulation.db"
   },
   "ui": {
     "refresh_secs": 2

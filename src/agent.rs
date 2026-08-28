@@ -9,28 +9,40 @@ use chrono::Utc;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::Instant;
 
+const READ_ONLY_DISABLED_CLINE_TOOLS: &[&str] = &[
+    "read_files",
+    "search_codebase",
+    "run_commands",
+    "editor",
+    "fetch_web_content",
+    "skills",
+    "ask_question",
+    "spawn_agent",
+    "teams",
+    "apply_patch",
+    "submit_and_exit",
+];
+
 #[derive(Debug, Clone, Copy)]
 pub enum Lane {
     EquityOptions,
-    Crypto,
 }
 
 impl Lane {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::EquityOptions => "equity_options",
-            Self::Crypto => "crypto",
         }
     }
 
     pub fn capabilities(self) -> &'static str {
         match self {
             Self::EquityOptions => "equities and options",
-            Self::Crypto => "crypto",
         }
     }
 }
@@ -40,6 +52,9 @@ pub struct AgentCommand {
     pub executable: String,
     pub args: Vec<String>,
     pub working_directory: Option<std::path::PathBuf>,
+    environment: Vec<(String, String)>,
+    cline_data_dir: PathBuf,
+    restrict_local_tools: bool,
 }
 
 impl AgentCommand {
@@ -90,20 +105,126 @@ impl AgentCommand {
             executable: config.executable.clone(),
             args,
             working_directory: config.working_directory.clone(),
+            environment: Vec::new(),
+            cline_data_dir: config.data_dir.clone(),
+            restrict_local_tools: false,
         }
+    }
+
+    fn restrict_local_commands(mut self) -> Self {
+        self.environment.push((
+            "CLINE_DATA_DIR".to_owned(),
+            self.cline_data_dir.display().to_string(),
+        ));
+        self.environment.push((
+            "CLINE_COMMAND_PERMISSIONS".to_owned(),
+            r#"{"allow":[],"deny":["*"]}"#.to_owned(),
+        ));
+        self.restrict_local_tools = true;
+        self
     }
 
     fn spawn(&self) -> Result<Output> {
         let executable =
             resolve_executable(&self.executable).unwrap_or_else(|| PathBuf::from(&self.executable));
         let mut command = process_command(&executable, &self.args);
+        let settings_guard = if self.restrict_local_tools {
+            Some(prepare_read_only_cline_tools(&self.cline_data_dir)?)
+        } else {
+            None
+        };
         if let Some(directory) = &self.working_directory {
             command.current_dir(directory);
         }
-        command
+        for (key, value) in &self.environment {
+            command.env(key, value);
+        }
+        let result = command
             .output()
-            .with_context(|| format!("failed to launch Cline executable '{}'", self.executable))
+            .with_context(|| format!("failed to launch Cline executable '{}'", self.executable));
+        if let Some(settings_guard) = settings_guard {
+            settings_guard.restore()?;
+        }
+        result
     }
+}
+
+struct ReadOnlyClineSettingsGuard {
+    path: PathBuf,
+    original: Option<Vec<u8>>,
+}
+
+impl ReadOnlyClineSettingsGuard {
+    fn restore(self) -> Result<()> {
+        match self.original {
+            Some(contents) => fs::write(&self.path, contents),
+            None => match fs::remove_file(&self.path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error),
+            },
+        }
+        .with_context(|| {
+            format!(
+                "failed to restore isolated Cline settings at {}",
+                self.path.display()
+            )
+        })
+    }
+}
+
+fn prepare_read_only_cline_tools(data_dir: &Path) -> Result<ReadOnlyClineSettingsGuard> {
+    let settings_path = data_dir.join("settings").join("global-settings.json");
+    let original = if settings_path.is_file() {
+        Some(fs::read(&settings_path).with_context(|| {
+            format!(
+                "failed to read isolated Cline settings at {}",
+                settings_path.display()
+            )
+        })?)
+    } else {
+        None
+    };
+    let mut settings = if let Some(contents) = original.as_deref() {
+        serde_json::from_slice::<Value>(contents).with_context(|| {
+            format!(
+                "isolated Cline settings at {} are not valid JSON",
+                settings_path.display()
+            )
+        })?
+    } else {
+        serde_json::json!({})
+    };
+    let object = settings
+        .as_object_mut()
+        .context("isolated Cline global settings must be a JSON object")?;
+    let disabled_tools = object
+        .entry("disabledTools")
+        .or_insert_with(|| serde_json::json!([]));
+    let disabled_tools = disabled_tools
+        .as_array_mut()
+        .context("isolated Cline disabledTools must be a JSON array")?;
+    for tool_name in READ_ONLY_DISABLED_CLINE_TOOLS {
+        if !disabled_tools
+            .iter()
+            .any(|value| value.as_str() == Some(tool_name))
+        {
+            disabled_tools.push(Value::String((*tool_name).to_owned()));
+        }
+    }
+    fs::create_dir_all(
+        settings_path
+            .parent()
+            .context("isolated Cline settings path has no parent directory")?,
+    )?;
+    fs::write(
+        &settings_path,
+        format!("{}\n", serde_json::to_string_pretty(&settings)?),
+    )?;
+    Ok(ReadOnlyClineSettingsGuard {
+        path: settings_path,
+        original,
+    })
 }
 
 pub fn resolve_executable(executable: &str) -> Option<PathBuf> {
@@ -160,6 +281,12 @@ fn process_command(executable: &Path, args: &[String]) -> Command {
         executable.extension().and_then(|value| value.to_str()),
         Some("cmd" | "bat")
     ) {
+        if let Some(script) = npm_package_script(executable) {
+            let mut command = Command::new("node");
+            command.arg(script);
+            command.args(args);
+            return command;
+        }
         let mut command = Command::new("cmd.exe");
         command.arg("/D").arg("/S").arg("/C").arg(executable);
         command.args(args);
@@ -169,6 +296,18 @@ fn process_command(executable: &Path, args: &[String]) -> Command {
     let mut command = Command::new(executable);
     command.args(args);
     command
+}
+
+#[cfg(windows)]
+fn npm_package_script(executable: &Path) -> Option<PathBuf> {
+    let package_name = executable.file_stem()?.to_str()?;
+    let script = executable
+        .parent()?
+        .join("node_modules")
+        .join(package_name)
+        .join("bin")
+        .join(package_name);
+    script.is_file().then_some(script)
 }
 
 fn find_candidate(directory: &Path, candidates: &[String]) -> Option<PathBuf> {
@@ -201,6 +340,15 @@ pub struct AgentRunResult {
     pub mcp_error_count: u32,
     pub unexpected_tool_count: u32,
     pub reconciliation: Option<ReconciliationReport>,
+    pub raw_output: String,
+    pub expected_reads_complete: bool,
+    pub mcp_outputs: BTreeMap<String, Vec<McpOutput>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct McpOutput {
+    pub is_error: bool,
+    pub value: Value,
 }
 
 #[derive(Debug, Clone)]
@@ -212,6 +360,7 @@ struct AgentTaskOptions {
     expected_mcp_tools: Option<HashSet<String>>,
     strict_typed_ingestion: bool,
     strategy_contract: Option<StrategyContract>,
+    restrict_local_commands: bool,
 }
 
 #[allow(dead_code)]
@@ -338,6 +487,7 @@ pub fn run_fresh_task_with_strategy_with_executor<E: AgentExecutor>(
             expected_mcp_tools: None,
             strict_typed_ingestion: false,
             strategy_contract: Some(strategy.clone()),
+            restrict_local_commands: false,
         },
         executor,
     )
@@ -362,6 +512,7 @@ pub fn run_read_only_smoke_test<E: AgentExecutor>(
             expected_mcp_tools: Some(HashSet::from(["get_accounts".to_owned()])),
             strict_typed_ingestion: false,
             strategy_contract: None,
+            restrict_local_commands: true,
         },
         executor,
     )
@@ -396,6 +547,75 @@ pub fn run_read_only_reconciliation<E: AgentExecutor>(
             ),
             strict_typed_ingestion: true,
             strategy_contract: None,
+            restrict_local_commands: true,
+        },
+        executor,
+    )
+}
+
+pub fn run_read_only_market_data<E: AgentExecutor>(
+    config: &AgentConfig,
+    store: &Store,
+    robinhood_server_name: &str,
+    market_data_tools: &[String],
+    symbols: &[String],
+    executor: &E,
+) -> Result<AgentRunResult> {
+    if market_data_tools.is_empty() {
+        anyhow::bail!("market-data simulation requires at least one configured tool");
+    }
+    let expected_tools = market_data_tools
+        .iter()
+        .map(|tool| tool.rsplit("__").next().unwrap_or(tool).to_owned())
+        .collect::<HashSet<_>>();
+    run_task_with_executor(
+        config,
+        store,
+        "market_data",
+        build_market_data_prompt(robinhood_server_name, market_data_tools, symbols),
+        AgentTaskOptions {
+            plan_mode: true,
+            auto_approve: true,
+            system_prompt: Some(build_market_data_system_prompt(robinhood_server_name)),
+            expected_mcp_server: Some(robinhood_server_name.to_owned()),
+            expected_mcp_tools: Some(expected_tools),
+            strict_typed_ingestion: false,
+            strategy_contract: None,
+            restrict_local_commands: true,
+        },
+        executor,
+    )
+}
+
+pub fn run_read_only_market_probe<E: AgentExecutor>(
+    config: &AgentConfig,
+    store: &Store,
+    robinhood_server_name: &str,
+    market_data_tools: &[String],
+    symbols: &[String],
+    executor: &E,
+) -> Result<AgentRunResult> {
+    if market_data_tools.is_empty() {
+        anyhow::bail!("market-data probe requires at least one configured tool");
+    }
+    let expected_tools = market_data_tools
+        .iter()
+        .map(|tool| tool.rsplit("__").next().unwrap_or(tool).to_owned())
+        .collect::<HashSet<_>>();
+    run_task_with_executor(
+        config,
+        store,
+        "market_probe",
+        build_market_probe_prompt(robinhood_server_name, market_data_tools, symbols),
+        AgentTaskOptions {
+            plan_mode: true,
+            auto_approve: true,
+            system_prompt: Some(build_market_data_system_prompt(robinhood_server_name)),
+            expected_mcp_server: Some(robinhood_server_name.to_owned()),
+            expected_mcp_tools: Some(expected_tools),
+            strict_typed_ingestion: false,
+            strategy_contract: None,
+            restrict_local_commands: true,
         },
         executor,
     )
@@ -422,6 +642,36 @@ fn build_reconciliation_system_prompt(server_name: &str) -> String {
 fn build_reconciliation_prompt(server_name: &str) -> String {
     format!(
         "Perform a startup READ-ONLY Robinhood account reconciliation using only the configured MCP server '{server_name}'. Call get_accounts exactly once with {{}}. From its returned data.accounts array, select the single object whose agentic_allowed field is true and copy that object's complete account_number string internally. The account_number must be passed unchanged in the MCP input; the instruction not to repeat account numbers applies only to your final response and not to tool arguments. Then make these three calls exactly once each, in this order: get_portfolio with {{account_number:<selected account_number>}}; get_realized_pnl with {{account_number:<selected account_number>,span:day,start_date:\"\",end_date:\"\",asset_classes:null,display_currency:USD,timezone:America/New_York}}; get_pnl_trade_history with {{account_number:<selected account_number>,span:week,symbol:\"\",cursor:\"\"}}. Do not call any other tool, including skills, shell, filesystem, browser, delegation, coding, or any other MCP tool. Do not place, cancel, replace, or preview an order. Do not modify Robinhood state. Do not stop after get_accounts or after an error: complete the remaining permitted read calls exactly once each. Return only success/failure and non-sensitive counts or schema metadata; never repeat account numbers, balances, positions, symbols, or tokens."
+    )
+}
+
+fn build_market_data_system_prompt(server_name: &str) -> String {
+    format!(
+        "You are a read-only market-data collector for the Robinhood Trading MCP server named '{server_name}', not a trading agent. Do not place, cancel, replace, preview, or submit orders. Do not modify watchlists, accounts, settings, or any Robinhood state. Do not use filesystem, shell, browser, delegation, coding, skills, or any non-Robinhood tool. If a configured endpoint is unavailable, do not substitute another endpoint and do not retry with a different tool; return failure and stop. Return only an optional paper-proposals envelope. Never invent, restate, summarize, or transform prices or timestamps; Hoodrat reads those from the raw MCP responses."
+    )
+}
+
+fn build_market_data_prompt(
+    server_name: &str,
+    market_data_tools: &[String],
+    symbols: &[String],
+) -> String {
+    format!(
+        "Collect current READ-ONLY equity and options market data using only the configured Robinhood Trading MCP server '{server_name}'. You may call only these configured read tools, and no other tools: {}. Call only the tools listed above, exactly once each, in dependency order. Do not return a paper_proposals envelope or terminate until every configured tool has been called exactly once. Call get_equity_quotes once with every configured equity symbol in its symbols array. If get_option_chains is configured, call it once for the first configured equity underlying using {{ids:\"\",underlying_symbol:\"<one symbol>\"}}. If get_option_instruments is configured, call it only after get_option_chains returns a non-empty chain id, passing that id unchanged as chain_id. If get_option_quotes is configured and get_option_instruments returns any instrument ids, calling get_option_quotes once with those returned ids is mandatory; do not treat an empty proposal envelope as a substitute for that quote read. If a dependency is empty or unavailable, do not invent identifiers and do not make an empty-ID quote call; report failure and stop. Never request crypto data. Never use watchlist, order, review, preview, place, cancel, replace, submit, get_accounts, or any other state-changing or fallback tool. Inspect only these configured symbols or their option contracts: {}. Never report or transform bid, ask, last price, timestamps, account data, or any other market value in your response; those values must be read from the raw MCP tool outputs by Hoodrat. Return only an optional machine-readable paper-proposals object with this shape: {{\\\"paper_proposals\\\":[{{\\\"action\\\":\\\"buy|sell|short|cover|reduce|close|hold\\\",\\\"symbol\\\":\\\"<quoted symbol>\\\",\\\"asset_class\\\":\\\"equity|option\\\",\\\"quantity\\\":<number>,\\\"limit_price\\\":<number or null>,\\\"underlying\\\":\\\"<underlying or null>\\\",\\\"option_type\\\":\\\"call|put or null\\\",\\\"strike\\\":<number or null>,\\\"expiration\\\":\\\"<RFC3339 UTC/date or null>\\\",\\\"multiplier\\\":<number or null>,\\\"reason\\\":\\\"paper-only rationale\\\"}}]}}. If data is missing, stale, ambiguous, unsupported, or unavailable after all configured reads have completed, return an empty paper_proposals array.",
+        market_data_tools.join(", "),
+        symbols.join(", ")
+    )
+}
+
+fn build_market_probe_prompt(
+    server_name: &str,
+    market_data_tools: &[String],
+    symbols: &[String],
+) -> String {
+    format!(
+        "Perform a READ-ONLY equity/options market-data schema probe using only the configured Robinhood Trading MCP server '{server_name}'. Call only the configured tools exactly once, in this dependency order: {}. Call get_equity_quotes once with all configured equity symbols. If get_option_chains is configured, call it once for one configured underlying with {{ids:\"\",underlying_symbol:\"<one symbol>\"}}. If get_option_instruments is configured, call it only after a non-empty chain id is returned, passing that id unchanged as chain_id. If get_option_quotes is configured, call it only after non-empty instrument ids are returned, passing them unchanged as instrument_ids. If a dependency is empty or unavailable, do not invent identifiers, do not call a fallback tool, and report failure. Never request crypto data. Never place, cancel, replace, preview, or submit an order. Never modify Robinhood state. Do not use skills or any fallback tool such as get_accounts. Return only a short success/failure statement. Do not repeat prices, timestamps, account numbers, credentials, or raw market data; Hoodrat persists and analyzes the raw tool responses locally. Configured symbols: {}.",
+        market_data_tools.join(", "),
+        symbols.join(", ")
     )
 }
 
@@ -455,6 +705,11 @@ fn run_task_with_executor<E: AgentExecutor>(
         options.auto_approve,
         options.system_prompt,
     );
+    let command = if options.restrict_local_commands {
+        command.restrict_local_commands()
+    } else {
+        command
+    };
     let started = Instant::now();
     let output = match executor.execute(&command) {
         Ok(output) => output,
@@ -482,6 +737,7 @@ fn run_task_with_executor<E: AgentExecutor>(
     let mut typed_payloads = BTreeMap::new();
     let mut typed_ingestion_error = None;
     let mut expected_tool_counts = BTreeMap::new();
+    let mut mcp_outputs = BTreeMap::new();
     let mut selected_account_number = None;
 
     for (index, line) in raw_output.lines().enumerate() {
@@ -569,6 +825,17 @@ fn run_task_with_executor<E: AgentExecutor>(
                     *expected_tool_counts
                         .entry(tool.target_name().to_ascii_lowercase())
                         .or_insert(0) += 1;
+                }
+                if is_expected_read {
+                    if let Some(output) = output_value.as_ref() {
+                        mcp_outputs
+                            .entry(tool.target_name().to_ascii_lowercase())
+                            .or_insert_with(Vec::new)
+                            .push(McpOutput {
+                                is_error: tool_is_error,
+                                value: output.clone(),
+                            });
+                    }
                 }
                 if is_expected_read && !tool_is_error {
                     robinhood_read_count += 1;
@@ -664,6 +931,16 @@ fn run_task_with_executor<E: AgentExecutor>(
     if summary.is_empty() {
         summary = "Cline produced no structured output.".to_owned();
     }
+    let expected_reads_complete = options.expected_mcp_tools.as_ref().is_some_and(|tools| {
+        tools.len() == expected_tool_counts.len()
+            && tools.iter().all(|tool| {
+                expected_tool_counts
+                    .get(&tool.to_ascii_lowercase())
+                    .copied()
+                    == Some(1)
+            })
+    }) && mcp_error_count == 0
+        && unexpected_tool_count == 0;
     let mut status = if output.status.success() {
         "completed"
     } else {
@@ -676,6 +953,15 @@ fn run_task_with_executor<E: AgentExecutor>(
     if output.status.success() && options.expected_mcp_server.is_some() && unexpected_tool_count > 0
     {
         status = "policy_violation";
+    }
+    if output.status.success()
+        && options.expected_mcp_server.is_some()
+        && robinhood_read_count > 0
+        && !expected_reads_complete
+        && unexpected_tool_count == 0
+        && mcp_error_count == 0
+    {
+        status = "market_data_incomplete";
     }
     let reconciliation = if options.strict_typed_ingestion && output.status.success() {
         let expected_count = options.expected_mcp_tools.as_ref().map_or(0, HashSet::len);
@@ -747,6 +1033,9 @@ fn run_task_with_executor<E: AgentExecutor>(
         mcp_error_count,
         unexpected_tool_count,
         reconciliation,
+        raw_output,
+        expected_reads_complete,
+        mcp_outputs,
     })
 }
 
@@ -788,6 +1077,11 @@ impl ToolEvent {
                 | "get_equity_fundamentals"
                 | "get_financials"
                 | "get_equity_price_book"
+                | "get_equity_quotes"
+                | "get_option_chains"
+                | "get_option_instruments"
+                | "get_option_quotes"
+                | "get_index_quotes"
         )
     }
 
@@ -1091,8 +1385,8 @@ mod tests {
 
     #[test]
     fn prompt_identifies_lane_and_safety_boundary() {
-        let prompt = build_prompt(Lane::Crypto, "state", "policy");
-        assert!(prompt.contains("crypto"));
+        let prompt = build_prompt(Lane::EquityOptions, "state", "policy");
+        assert!(prompt.contains("equity_options"));
         assert!(prompt.contains("not a pre-trade firewall"));
         assert!(prompt.contains("state"));
     }
@@ -1164,6 +1458,49 @@ mod tests {
             .windows(2)
             .any(|pair| pair == ["--system", "single-line system prompt"]));
         assert_eq!(command.args.last(), Some(&"smoke prompt".to_owned()));
+    }
+
+    #[test]
+    fn read_only_tasks_deny_local_shell_commands() {
+        let config = AgentConfig::default();
+        let command = AgentCommand::from_config_with_options(
+            &config,
+            "probe prompt".to_owned(),
+            true,
+            true,
+            Some("read-only system prompt".to_owned()),
+        )
+        .restrict_local_commands();
+        assert_eq!(
+            command.environment,
+            vec![
+                ("CLINE_DATA_DIR".to_owned(), "data/cline/data".to_owned()),
+                (
+                    "CLINE_COMMAND_PERMISSIONS".to_owned(),
+                    r#"{"allow":[],"deny":["*"]}"#.to_owned()
+                )
+            ]
+        );
+    }
+
+    #[test]
+    fn read_only_profile_disables_all_builtin_workspace_tools() {
+        let directory = std::env::temp_dir().join(format!(
+            "hoodrat-cline-settings-{}",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let guard = prepare_read_only_cline_tools(&directory).unwrap();
+        let settings = serde_json::from_str::<Value>(
+            &fs::read_to_string(directory.join("settings/global-settings.json")).unwrap(),
+        )
+        .unwrap();
+        let disabled = settings["disabledTools"].as_array().unwrap();
+        assert!(READ_ONLY_DISABLED_CLINE_TOOLS
+            .iter()
+            .all(|tool| disabled.iter().any(|value| value.as_str() == Some(tool))));
+        guard.restore().unwrap();
+        assert!(!directory.join("settings/global-settings.json").exists());
+        let _ = fs::remove_dir_all(directory);
     }
 
     #[test]
@@ -1380,6 +1717,38 @@ mod tests {
             store.latest_run().unwrap().unwrap().status,
             "policy_violation"
         );
+    }
+
+    #[test]
+    fn market_data_task_requires_configured_reads_and_preserves_raw_outputs() {
+        let output = concat!(
+            "{\"type\":\"tool_call\",\"tool_name\":\"robinhood-trading__get_equity_price_book\",\"input\":{\"symbol\":\"SPY\"},\"output\":{\"ok\":true}}\n",
+            "{\"type\":\"tool_call\",\"tool_name\":\"robinhood-trading__get_equity_historicals\",\"input\":{\"symbol\":\"SPY\"},\"output\":{\"ok\":true}}\n",
+            "{\"type\":\"say\",\"text\":\"{\\\"paper_proposals\\\":[]}\"}"
+        );
+        let executor = FakeExecutor {
+            stdout: output.as_bytes().to_vec(),
+            stderr: Vec::new(),
+            status: success_status(),
+        };
+        let store = Store::open(std::path::Path::new(":memory:")).unwrap();
+        let result = run_read_only_market_data(
+            &AgentConfig::default(),
+            &store,
+            "robinhood-trading",
+            &[
+                "get_equity_price_book".to_owned(),
+                "get_equity_historicals".to_owned(),
+            ],
+            &["SPY".to_owned()],
+            &executor,
+        )
+        .unwrap();
+        assert_eq!(result.robinhood_read_count, 2);
+        assert_eq!(result.unexpected_tool_count, 0);
+        assert!(result.expected_reads_complete);
+        assert_eq!(result.mcp_outputs.len(), 2);
+        assert!(result.raw_output.contains("paper_proposals"));
     }
 
     #[test]

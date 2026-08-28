@@ -51,9 +51,6 @@ pub fn check(config: &Config) -> ReadinessReport {
     if config.schedule.equity_options.interval_secs == 0 {
         blockers.push("equity/options interval must be greater than zero".to_owned());
     }
-    if config.schedule.crypto.interval_secs == 0 {
-        blockers.push("crypto interval must be greater than zero".to_owned());
-    }
     if config.risk.max_order_notional_usd <= 0.0 {
         blockers.push("max order notional must be greater than zero".to_owned());
     }
@@ -75,8 +72,8 @@ pub fn check(config: &Config) -> ReadinessReport {
         );
     }
 
-    if !config.schedule.equity_options.enabled && !config.schedule.crypto.enabled {
-        notes.push("both schedule lanes are disabled".to_owned());
+    if !config.schedule.equity_options.enabled {
+        notes.push("equity/options schedule lane is disabled".to_owned());
     }
 
     ReadinessReport {
@@ -110,7 +107,7 @@ mod tests {
         config.risk.confirmed = true;
         config.robinhood.connection_ready = true;
         config.strategy.canary_enabled = true;
-        config.strategy.approved_symbols = vec!["BTC".to_owned()];
+        config.strategy.approved_symbols = vec!["SPY".to_owned()];
         assert!(check(&config).ready);
     }
 

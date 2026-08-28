@@ -41,8 +41,6 @@ pub fn run(config: &Config, store: &Store, once: bool) -> Result<()> {
 
     let mut last_equity =
         Instant::now() - Duration::from_secs(config.schedule.equity_options.interval_secs);
-    let mut last_crypto =
-        Instant::now() - Duration::from_secs(config.schedule.crypto.interval_secs);
     loop {
         let now = Instant::now();
         if config.schedule.equity_options.enabled
@@ -53,12 +51,6 @@ pub fn run(config: &Config, store: &Store, once: bool) -> Result<()> {
                 run_lane(config, store, Lane::EquityOptions)?;
             }
             last_equity = now;
-        }
-        if config.schedule.crypto.enabled
-            && now.duration_since(last_crypto).as_secs() >= config.schedule.crypto.interval_secs
-        {
-            run_lane(config, store, Lane::Crypto)?;
-            last_crypto = now;
         }
         thread::sleep(Duration::from_secs(1));
     }
@@ -75,8 +67,6 @@ pub fn run_from_path(config_path: &Path, once: bool) -> Result<()> {
 
     let mut last_equity =
         Instant::now() - Duration::from_secs(config.schedule.equity_options.interval_secs);
-    let mut last_crypto =
-        Instant::now() - Duration::from_secs(config.schedule.crypto.interval_secs);
     let mut last_readiness: Option<bool> = None;
     let mut reconciliation_ready: Option<bool> = None;
 
@@ -123,12 +113,6 @@ pub fn run_from_path(config_path: &Path, once: bool) -> Result<()> {
                     run_lane(&config, &store, Lane::EquityOptions)?;
                 }
                 last_equity = now;
-            }
-            if config.schedule.crypto.enabled
-                && now.duration_since(last_crypto).as_secs() >= config.schedule.crypto.interval_secs
-            {
-                run_lane(&config, &store, Lane::Crypto)?;
-                last_crypto = now;
             }
         }
         thread::sleep(Duration::from_secs(1));
@@ -206,9 +190,6 @@ fn run_due_lanes(config: &Config, store: &Store, one_shot: bool) -> Result<()> {
                 &serde_json::json!({"reason": "outside configured local market window", "one_shot": one_shot}),
             )?;
         }
-    }
-    if config.schedule.crypto.enabled {
-        run_lane(config, store, Lane::Crypto)?;
     }
     Ok(())
 }
@@ -330,7 +311,6 @@ mod tests {
     #[test]
     fn strategy_contract_restricts_scheduler_lanes() {
         let strategy = Config::default().strategy;
-        assert!(strategy_allows_lane(&strategy, Lane::Crypto));
-        assert!(!strategy_allows_lane(&strategy, Lane::EquityOptions));
+        assert!(strategy_allows_lane(&strategy, Lane::EquityOptions));
     }
 }

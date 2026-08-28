@@ -3,14 +3,20 @@ mod config;
 mod ingestion;
 mod readiness;
 mod scheduler;
+mod simulator;
 mod store;
 
-use agent::{run_executable_version, run_read_only_reconciliation, run_read_only_smoke_test};
+use agent::{
+    run_executable_version, run_read_only_market_data, run_read_only_market_probe,
+    run_read_only_reconciliation, run_read_only_smoke_test,
+};
 use anyhow::{Context, Result};
+use chrono::Utc;
 use clap::{Parser, Subcommand};
 use config::{default_config_path, Config};
 use readiness::check;
 use scheduler::{run as run_scheduler, run_from_path as run_scheduler_from_path};
+use simulator::{simulate as run_paper_simulation, MarketPlan};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use store::Store;
@@ -40,6 +46,10 @@ enum CommandKind {
     SmokeTest,
     /// Run the four-tool read-only account/portfolio reconciliation.
     Reconcile,
+    /// Fetch read-only live market data and run the local paper simulator.
+    Simulate,
+    /// Probe configured read-only MCP market-data tools and print redacted schemas.
+    MarketProbe,
     /// Accept the latest detected reconciliation drift as a new operator-approved baseline.
     AcceptBaseline {
         /// Required acknowledgement that the latest drift was reviewed.
@@ -69,6 +79,8 @@ fn main() -> Result<()> {
         CommandKind::Doctor => doctor(&cli.config),
         CommandKind::SmokeTest => smoke_test(&cli.config),
         CommandKind::Reconcile => reconcile(&cli.config),
+        CommandKind::Simulate => simulate_market(&cli.config),
+        CommandKind::MarketProbe => market_probe(&cli.config),
         CommandKind::AcceptBaseline {
             confirm,
             operator,
@@ -342,6 +354,143 @@ fn reconcile(config_path: &Path) -> Result<()> {
     {
         anyhow::bail!("Robinhood MCP reconciliation did not establish a usable baseline");
     }
+    Ok(())
+}
+
+fn simulate_market(config_path: &Path) -> Result<()> {
+    let (config, store) = load_runtime(config_path)?;
+    config.simulation.validate()?;
+    if config.execution.mode != config::ExecutionMode::Disabled {
+        anyhow::bail!("simulate requires execution.mode=disabled");
+    }
+    if !config.execution.kill_switch_engaged {
+        anyhow::bail!("simulate requires the kill switch to remain engaged");
+    }
+    if config.risk.confirmed {
+        anyhow::bail!("simulate requires risk.confirmed=false");
+    }
+    if !config.robinhood.agentic_account_only {
+        anyhow::bail!("simulate requires robinhood.agentic_account_only=true");
+    }
+
+    println!("starting read-only live market-data paper simulation");
+    println!("simulation profile: {}", config.simulation.profile.name);
+    println!(
+        "market-data tools: {}",
+        config.simulation.market_data_tools.join(", ")
+    );
+    println!("symbols: {}", config.simulation.symbols.join(", "));
+    println!("safety mode: plan=true, auto_approve=true, no broker writes");
+
+    let result = run_read_only_market_data(
+        &config.agent,
+        &store,
+        &config.robinhood.mcp_server_name,
+        &config.simulation.market_data_tools,
+        &config.simulation.symbols,
+        &agent::ProcessAgentExecutor,
+    )?;
+    if result.exit_code != Some(0) {
+        anyhow::bail!(
+            "read-only market-data task exited with {:?}",
+            result.exit_code
+        );
+    }
+    if result.mcp_error_count > 0
+        || result.unexpected_tool_count > 0
+        || !result.expected_reads_complete
+    {
+        anyhow::bail!(
+            "read-only market-data policy failed: complete={}, mcp_errors={}, unexpected_tools={}",
+            result.expected_reads_complete,
+            result.mcp_error_count,
+            result.unexpected_tool_count
+        );
+    }
+    if result.robinhood_read_count == 0 {
+        anyhow::bail!("read-only market-data task produced no successful MCP reads");
+    }
+
+    let proposals = MarketPlan::paper_proposals_from_agent_output(&result.raw_output)?;
+    let plan = MarketPlan::from_mcp_outputs(
+        &result.mcp_outputs,
+        proposals,
+        &config.simulation,
+        Utc::now(),
+    )?;
+    let simulation = run_paper_simulation(plan, &config.simulation, Utc::now())?;
+    store.record_paper_simulation(&simulation)?;
+    println!(
+        "paper simulation {} status={}, events={}, positions={}, final_equity=${:.2}, realized_pnl=${:.2}, unrealized_pnl=${:.2}",
+        simulation.id,
+        simulation.status,
+        simulation.events.len(),
+        simulation.positions.len(),
+        simulation.final_equity_usd,
+        simulation.realized_pnl_usd,
+        simulation.unrealized_pnl_usd
+    );
+    for reason in &simulation.no_op_reasons {
+        println!("  no-op: {reason}");
+    }
+    println!("No configuration or broker execution flags were changed.");
+    Ok(())
+}
+
+fn market_probe(config_path: &Path) -> Result<()> {
+    let (config, store) = load_runtime(config_path)?;
+    config.simulation.validate_market_data()?;
+    if config.execution.mode != config::ExecutionMode::Disabled {
+        anyhow::bail!("market-probe requires execution.mode=disabled");
+    }
+    if !config.execution.kill_switch_engaged {
+        anyhow::bail!("market-probe requires the kill switch to remain engaged");
+    }
+    if config.risk.confirmed {
+        anyhow::bail!("market-probe requires risk.confirmed=false");
+    }
+    if !config.robinhood.agentic_account_only {
+        anyhow::bail!("market-probe requires robinhood.agentic_account_only=true");
+    }
+
+    println!("starting read-only MCP market-data schema probe");
+    println!("tools: {}", config.simulation.market_data_tools.join(", "));
+    println!("symbols: {}", config.simulation.symbols.join(", "));
+    println!("safety mode: plan=true, auto_approve=true, no broker writes");
+    let result = run_read_only_market_probe(
+        &config.agent,
+        &store,
+        &config.robinhood.mcp_server_name,
+        &config.simulation.market_data_tools,
+        &config.simulation.symbols,
+        &agent::ProcessAgentExecutor,
+    )?;
+    println!(
+        "market probe run {} finished with exit={:?}, reads={}, errors={}, unexpected_tools={}, complete={}",
+        result.run_id,
+        result.exit_code,
+        result.robinhood_read_count,
+        result.mcp_error_count,
+        result.unexpected_tool_count,
+        result.expected_reads_complete
+    );
+    for summary in simulator::summarize_mcp_outputs(&result.mcp_outputs) {
+        println!("  {summary}");
+    }
+    if result.exit_code != Some(0) {
+        anyhow::bail!(
+            "read-only market-data probe exited with {:?}",
+            result.exit_code
+        );
+    }
+    if result.unexpected_tool_count > 0 || result.mcp_error_count > 0 {
+        anyhow::bail!("market-data probe observed a policy violation or MCP error");
+    }
+    if !result.expected_reads_complete {
+        anyhow::bail!("market-data probe did not complete every configured read exactly once");
+    }
+    println!("Raw MCP responses were persisted in the configured SQLite run/tool-event store.");
+    println!("No configuration or broker execution flags were changed.");
     Ok(())
 }
 
