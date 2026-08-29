@@ -1589,6 +1589,52 @@ impl Store {
             })
     }
 
+    /// Fetch a recorded proposal with its verdict and run id.
+    pub fn get_proposal(
+        &self,
+        proposal_id: i64,
+    ) -> Result<Option<(crate::firewall::OrderProposal, String, Option<String>)>> {
+        let stored = self.connection.query_row(
+            "SELECT proposal_json, verdict, run_id FROM order_proposals WHERE id = ?1",
+            params![proposal_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
+        );
+        let Some((json, verdict, run_id)) = stored.optional()? else {
+            return Ok(None);
+        };
+        let proposal = serde_json::from_str::<crate::firewall::OrderProposal>(&json)
+            .context("stored proposal JSON could not be decoded")?;
+        Ok(Some((proposal, verdict, run_id)))
+    }
+
+    /// Link a successfully-run submission task to an order approval record.
+    pub fn record_submitted_run(&self, proposal_id: i64, run_id: &str) -> Result<()> {
+        self.connection.execute(
+            "UPDATE order_approvals SET submitted_task_id = ?1 WHERE proposal_id = ?2",
+            params![run_id, proposal_id],
+        )?;
+        Ok(())
+    }
+
+    /// Ingest a single `place_order` MCP output as an execution record.
+    /// Returns Ok(true) when the output decoded as an execution, Ok(false)
+    /// when it did not (so the caller can log but not fabricate a fill).
+    pub fn ingest_order_output(&self, run_id: &str, raw: &serde_json::Value) -> Result<bool> {
+        match ExecutionRecord::from_value(raw) {
+            Ok(execution) => {
+                self.ingest_execution(&execution, Some(run_id))?;
+                Ok(true)
+            }
+            Err(_) => Ok(false),
+        }
+    }
+
     /// Record an explicit operator approval of an approved order proposal.
     pub fn record_order_approval(
         &self,

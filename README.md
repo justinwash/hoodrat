@@ -330,14 +330,30 @@ cargo run -- gate            # show firewall state + recent proposals
 cargo run -- propose --symbol SPY --side buy --notional 25 --yes
 cargo run -- pending         # list approved proposals awaiting operator approval
 cargo run -- approve --id 3 --operator you --reason "reviewed" --confirm
+cargo run -- submit --id 3 --confirm
 ```
 
 The safe default posture is `gateway.submit=false`: a fully-approved proposal is
-recorded with an `approved` verdict but is **never submitted**. Set
-`gateway.submit=true` in `hoodrat.json` only when you want the scheduler/CLI
-execution path to honor an approved proposal end-to-end, and keep
-`gateway.require_operator_approval=true` for a manual go-ahead (the `approve`
-command records the operator approval that `gateway.submit=true` then requires).
+recorded with an `approved` verdict but is **never submitted**. The full path to
+a real order is deliberately multi-gated and operator-driven:
+
+1. `propose` records a proposal through the firewall (verdict: blocked/approved).
+2. `gate`/`pending` show where it stands; `approve` records explicit operator
+   approval (the `order_approvals` table + an audit event).
+3. `submit --id N --confirm` actually places the order — but only when **all**
+   of the following are true:
+   - `execution.mode` is `live` and the kill switch is released;
+   - `gateway.submit=true` in `hoodrat.json`;
+   - `gateway.require_operator_approval=true` is satisfied by a recorded approval;
+   - the proposal is approved and carries concrete `account_number`, `quantity`,
+     and `limit_price`.
+
+The `submit` path runs a single, strictly-constrained Cline task whose expected
+MCP tool set is exactly `{place_order}` with local-tool restrictions forced on:
+if Cline calls any other tool, the run is marked `policy_violation` and Hoodrat
+reports the order as NOT submitted. Successful `place_order` outputs are parsed
+into `executions` and the audit log, and the approval record is linked to the
+submission run id.
 
 The live equity/options lane is prompted to return a machine-readable decision
 block (not to submit directly); the scheduler feeds any such block through the

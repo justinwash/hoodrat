@@ -656,6 +656,76 @@ fn build_reconciliation_system_prompt(server_name: &str) -> String {
     )
 }
 
+fn build_submit_order_system_prompt(server_name: &str) -> String {
+    format!(
+        "You are a deterministic order-submission executor, not a trading analyst. The only permitted external service is the Robinhood Trading MCP server named '{server_name}'. You may call exactly one MCP tool, and no other tool or built-in workspace tool: place_order. Do NOT call any other MCP tool, including reads, quotes, watchlists, orders, skills, shell, filesystem, browser, delegation, coding, checkpoint, or editor. Do not inspect or modify the local workspace. Submit the order exactly as specified in the task with the provided account_number, symbol, side, order_type, quantity, limit_price, and time_in_force values. Do not alter, extrapolate, or substitute parameters. Do not call place_order more than once. Do not call preview_order, cancel_order, replace_order, or any other tool. If place_order is unavailable or returns an error, report that fact and stop; do NOT retry with a different tool or different parameters. Never expose credentials or tokens."
+    )
+}
+
+fn build_submit_order_prompt(
+    server_name: &str,
+    proposal: &crate::firewall::OrderProposal,
+) -> String {
+    format!(
+        "Call the Robinhood Trading MCP tool 'place_order' on server '{server_name}' exactly once with the following parameters from the proposal below. Pass the account_number unchanged.\n\n\
+Order proposal (from the Hoodrat pre-trade firewall):\n\
+- account_number: {}\n\
+- symbol: {}\n\
+- side: {}\n\
+- order_type: {}\n\
+- quantity: {}\n\
+- limit_price: {}\n\
+- notional_usd (reference only): {}\n\n\
+Do not call any other tool. Return the place_order result verbatim.",
+        proposal.account_number.as_deref().unwrap_or("<missing>"),
+        proposal.symbol,
+        proposal.side,
+        proposal.order_type,
+        proposal
+            .quantity
+            .map(|q| format!("{q}"))
+            .unwrap_or_else(|| "<missing>".to_owned()),
+        proposal
+            .limit_price
+            .map(|p| format!("{p}"))
+            .unwrap_or_else(|| "<missing>".to_owned()),
+        proposal.notional_usd,
+    )
+}
+
+/// Execute an approved + operator-approved order proposal through the
+/// Robinhood Trading MCP `place_order` tool as a single, strictly-constrained
+/// Cline task. The enforcement here is deterministic: the task's expected MCP
+/// tool set is exactly {place_order} (restrict_local_commands forced on), so if
+/// Cline calls any other tool the run is marked a policy_violation and the
+/// caller must not treat the order as submitted. The safe path never calls
+/// this without the CLI `submit` command having passed `submission_blockers`.
+pub fn run_submit_order_task<E: AgentExecutor>(
+    config: &AgentConfig,
+    store: &Store,
+    robinhood_server_name: &str,
+    proposal: &crate::firewall::OrderProposal,
+    executor: &E,
+) -> Result<AgentRunResult> {
+    run_task_with_executor(
+        config,
+        store,
+        "submit_order",
+        build_submit_order_prompt(robinhood_server_name, proposal),
+        AgentTaskOptions {
+            plan_mode: false,
+            auto_approve: true,
+            system_prompt: Some(build_submit_order_system_prompt(robinhood_server_name)),
+            expected_mcp_server: Some(robinhood_server_name.to_owned()),
+            expected_mcp_tools: Some(HashSet::from(["place_order".to_owned()])),
+            strict_typed_ingestion: false,
+            strategy_contract: None,
+            restrict_local_commands: true,
+        },
+        executor,
+    )
+}
+
 fn build_reconciliation_prompt(server_name: &str) -> String {
     format!(
         "Perform a startup READ-ONLY Robinhood account reconciliation using only the configured MCP server '{server_name}'. Call get_accounts exactly once with {{}}. From its returned data.accounts array, select the single object whose agentic_allowed field is true and copy that object's complete account_number string internally. The account_number must be passed unchanged in the MCP input; the instruction not to repeat account numbers applies only to your final response and not to tool arguments. Then make these three calls exactly once each, in this order: get_portfolio with {{account_number:<selected account_number>}}; get_realized_pnl with {{account_number:<selected account_number>,span:day,start_date:\"\",end_date:\"\",asset_classes:null,display_currency:USD,timezone:America/New_York}}; get_pnl_trade_history with {{account_number:<selected account_number>,span:week,symbol:\"\",cursor:\"\"}}. Do not call any other tool, including skills, shell, filesystem, browser, delegation, coding, or any other MCP tool. Do not place, cancel, replace, or preview an order. Do not modify Robinhood state. Do not stop after get_accounts or after an error: complete the remaining permitted read calls exactly once each. Return only success/failure and non-sensitive counts or schema metadata; never repeat account numbers, balances, positions, symbols, or tokens."
@@ -1906,6 +1976,80 @@ mod tests {
         assert_eq!(
             store.latest_run().unwrap().unwrap().status,
             "reconciliation_failed"
+        );
+    }
+
+    fn order_proposal() -> crate::firewall::OrderProposal {
+        crate::firewall::OrderProposal {
+            account_number: Some("888248572".to_owned()),
+            asset_class: "equity".to_owned(),
+            symbol: "SPY".to_owned(),
+            side: "buy".to_owned(),
+            order_type: "limit".to_owned(),
+            quantity: Some(1.0),
+            notional_usd: 25.0,
+            limit_price: Some(500.0),
+            quote_price: None,
+            quote_captured_at: None,
+            source: "test".to_owned(),
+        }
+    }
+
+    #[test]
+    fn submit_task_enforces_single_place_order_call() {
+        let output = concat!(
+            "{\"type\":\"agent_event\",\"event\":{\"type\":\"content_start\",\"contentType\":\"tool\",\"toolName\":\"robinhood-trading__place_order\",\"toolCallId\":\"order1\",\"input\":{\"account_number\":\"888248572\",\"symbol\":\"SPY\",\"side\":\"buy\",\"order_type\":\"limit\",\"quantity\":1,\"limit_price\":500.0}}}\n",
+            "{\"type\":\"agent_event\",\"event\":{\"type\":\"content_end\",\"contentType\":\"tool\",\"toolName\":\"robinhood-trading__place_order\",\"toolCallId\":\"order1\",\"output\":{\"id\":\"ord-1\",\"symbol\":\"SPY\",\"side\":\"buy\",\"quantity\":1,\"average_fill_price\":499.5,\"status\":\"filled\",\"notional_usd\":499.5}}}\n"
+        );
+        let executor = FakeExecutor {
+            stdout: output.as_bytes().to_vec(),
+            stderr: Vec::new(),
+            status: success_status(),
+        };
+        let store = Store::open(std::path::Path::new(":memory:")).unwrap();
+        let result = run_submit_order_task(
+            &AgentConfig::default(),
+            &store,
+            "robinhood-trading",
+            &order_proposal(),
+            &executor,
+        )
+        .unwrap();
+        assert_eq!(result.unexpected_tool_count, 0);
+        assert_eq!(result.mcp_error_count, 0);
+        assert!(result.expected_reads_complete);
+        assert_eq!(store.latest_run().unwrap().unwrap().status, "completed");
+        assert!(result.mcp_outputs.contains_key("place_order"));
+    }
+
+    #[test]
+    fn submit_task_flags_unexpected_tools_as_policy_violation() {
+        // The agent also called get_accounts → policy violation, order not OK.
+        let output = concat!(
+            "{\"type\":\"agent_event\",\"event\":{\"type\":\"content_start\",\"contentType\":\"tool\",\"toolName\":\"robinhood-trading__get_accounts\",\"toolCallId\":\"acct\",\"input\":{}}}\n",
+            "{\"type\":\"agent_event\",\"event\":{\"type\":\"content_end\",\"contentType\":\"tool\",\"toolName\":\"robinhood-trading__get_accounts\",\"toolCallId\":\"acct\",\"output\":{\"ok\":true}}}\n",
+            "{\"type\":\"agent_event\",\"event\":{\"type\":\"content_start\",\"contentType\":\"tool\",\"toolName\":\"robinhood-trading__place_order\",\"toolCallId\":\"order1\",\"input\":{\"account_number\":\"888248572\"}}}\n",
+            "{\"type\":\"agent_event\",\"event\":{\"type\":\"content_end\",\"contentType\":\"tool\",\"toolName\":\"robinhood-trading__place_order\",\"toolCallId\":\"order1\",\"output\":{\"id\":\"ord-2\"}}}\n"
+        );
+        let executor = FakeExecutor {
+            stdout: output.as_bytes().to_vec(),
+            stderr: Vec::new(),
+            status: success_status(),
+        };
+        let store = Store::open(std::path::Path::new(":memory:")).unwrap();
+        let result = run_submit_order_task(
+            &AgentConfig::default(),
+            &store,
+            "robinhood-trading",
+            &order_proposal(),
+            &executor,
+        )
+        .unwrap();
+        assert_eq!(result.unexpected_tool_count, 1);
+        assert!(!result.expected_reads_complete);
+        assert_eq!(
+            store.latest_run().unwrap().unwrap().status,
+            "policy_violation"
         );
     }
 }

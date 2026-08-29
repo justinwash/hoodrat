@@ -9,7 +9,8 @@ mod store;
 
 use agent::{
     run_executable_version, run_read_only_market_data, run_read_only_market_probe,
-    run_read_only_reconciliation, run_read_only_smoke_test,
+    run_read_only_reconciliation, run_read_only_smoke_test, run_submit_order_task,
+    ProcessAgentExecutor,
 };
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -100,6 +101,9 @@ enum CommandKind {
         /// Limit price (optional).
         #[arg(long)]
         limit_price: Option<f64>,
+        /// Agentic account number (required to eventually submit).
+        #[arg(long)]
+        account_number: Option<String>,
         /// Do not prompt for confirmation when recording.
         #[arg(long)]
         yes: bool,
@@ -118,6 +122,16 @@ enum CommandKind {
         #[arg(long, required = true)]
         reason: String,
         /// Required acknowledgement.
+        #[arg(long, required = true)]
+        confirm: bool,
+    },
+    /// Submit an approved + operator-approved proposal to the broker through the
+    /// place_order MCP tool (requires gateway.submit=true).
+    Submit {
+        /// Proposal id that is approved and operator-approved.
+        #[arg(long, required = true)]
+        id: i64,
+        /// Required acknowledgement that this places a real order.
         #[arg(long, required = true)]
         confirm: bool,
     },
@@ -148,6 +162,7 @@ fn main() -> Result<()> {
             notional,
             quantity,
             limit_price,
+            account_number,
             yes,
         } => propose(
             &cli.config,
@@ -157,6 +172,7 @@ fn main() -> Result<()> {
             notional,
             quantity,
             limit_price,
+            account_number.as_deref(),
             yes,
         ),
         CommandKind::Pending => pending(&cli.config),
@@ -166,6 +182,7 @@ fn main() -> Result<()> {
             reason,
             confirm,
         } => approve(&cli.config, id, &operator, &reason, confirm),
+        CommandKind::Submit { id, confirm } => submit(&cli.config, id, confirm),
     }
 }
 
@@ -636,14 +653,24 @@ fn gate(config_path: &Path) -> Result<()> {
         println!("  (none recorded yet)\n");
     } else {
         for row in proposals {
+            let approved_mark = if row.verdict == "approved" {
+                if store.has_operator_approval(row.id)? {
+                    "  (operator-approved)".to_owned()
+                } else {
+                    "  (awaiting approval)".to_owned()
+                }
+            } else {
+                String::new()
+            };
             println!(
-                "  #{:<4} {:<19} {:<7} {:<10} {:<9} {}",
+                "  #{:<4} {:<19} {:<7} {:<10} {:<9} {}{}",
                 row.id,
                 short_ts(&row.proposed_at),
                 row.symbol,
                 row.side,
                 fmt_money(Some(row.notional_usd)),
-                row.verdict
+                row.verdict,
+                approved_mark
             );
         }
     }
@@ -659,11 +686,12 @@ fn propose(
     notional: f64,
     quantity: Option<f64>,
     limit_price: Option<f64>,
+    account_number: Option<&str>,
     yes: bool,
 ) -> Result<()> {
     let (config, store) = load_runtime(config_path)?;
     let proposal = firewall::OrderProposal {
-        account_number: None,
+        account_number: account_number.map(ToOwned::to_owned),
         asset_class: asset_class.to_owned(),
         symbol: symbol.to_uppercase(),
         side: side.to_owned(),
@@ -767,6 +795,130 @@ fn approve(config_path: &Path, id: i64, operator: &str, reason: &str, confirm: b
         for blocker in blockers {
             println!("    - {blocker}");
         }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn submit(config_path: &Path, id: i64, confirm: bool) -> Result<()> {
+    if !confirm {
+        anyhow::bail!("--confirm is required to submit a real order");
+    }
+    let (config, store) = load_runtime(config_path)?;
+
+    // ── Absolute safety gates before ANY submission path ──────────
+    if config.execution.kill_switch_engaged {
+        anyhow::bail!("refusing to submit: kill switch is engaged");
+    }
+    if config.execution.mode != config::ExecutionMode::Live {
+        anyhow::bail!("refusing to submit: execution.mode must be live");
+    }
+
+    let (proposal, verdict, run_id) = store
+        .get_proposal(id)?
+        .context("proposal not found; list them with `cargo run -- gate`")?;
+    if verdict != "approved" {
+        anyhow::bail!("proposal #{id} is not approved (verdict={verdict}); cannot submit");
+    }
+
+    let blockers = firewall::submission_blockers(&config, &store, id)?;
+    if !blockers.is_empty() {
+        println!("proposal #{id} is blocked from submission:");
+        for blocker in &blockers {
+            println!("  - {blocker}");
+        }
+        anyhow::bail!("submission blocked by the pre-trade firewall");
+    }
+
+    // A real order needs a concrete account, quantity, and limit price.
+    if proposal.account_number.is_none()
+        || proposal.quantity.is_none()
+        || proposal.limit_price.is_none()
+    {
+        anyhow::bail!(
+            "proposal #{id} is missing account_number/quantity/limit_price; \
+             re-propose with concrete values before submitting"
+        );
+    }
+
+    println!(
+        "Submitting order: {} {} {} qty={:?} limit={:?} via place_order",
+        proposal.side,
+        proposal.symbol,
+        proposal.asset_class,
+        proposal.quantity,
+        proposal.limit_price
+    );
+    println!(
+        "  (source proposal run: {})",
+        run_id.unwrap_or_else(|| "cli".to_owned())
+    );
+
+    let executor = ProcessAgentExecutor;
+    let result = run_submit_order_task(
+        &config.agent,
+        &store,
+        &config.robinhood.mcp_server_name,
+        &proposal,
+        &executor,
+    )?;
+
+    let succeeded = result.exit_code == Some(0)
+        && result.expected_reads_complete
+        && result.unexpected_tool_count == 0
+        && result.mcp_error_count == 0
+        && result
+            .mcp_outputs
+            .get("place_order")
+            .is_some_and(|outputs| outputs.iter().any(|o| !o.is_error));
+
+    store.record_audit(
+        Some(&result.run_id),
+        "firewall",
+        if succeeded {
+            "submitted"
+        } else {
+            "submit_failed"
+        },
+        &serde_json::json!({
+            "proposal_id": id,
+            "symbol": proposal.symbol,
+            "side": proposal.side,
+            "notional_usd": proposal.notional_usd,
+            "succeeded": succeeded,
+            "exit_code": result.exit_code,
+            "unexpected_tool_count": result.unexpected_tool_count,
+            "mcp_error_count": result.mcp_error_count,
+            "expected_reads_complete": result.expected_reads_complete,
+        }),
+    )?;
+
+    if succeeded {
+        store.record_submitted_run(id, &result.run_id)?;
+        // Ingest any place_order output that decodes as an execution.
+        if let Some(outputs) = result.mcp_outputs.get("place_order") {
+            for output in outputs {
+                if !output.is_error {
+                    let _ = store.ingest_order_output(&result.run_id, &output.value);
+                }
+            }
+        }
+        println!(
+            "  RESULT: order submitted (task {}) — verify the fill in `cargo run -- gate` and the dashboard.",
+            result.run_id
+        );
+    } else {
+        println!("  RESULT: order was NOT submitted (task {})", result.run_id);
+        if result.unexpected_tool_count > 0 {
+            println!("    - the submission task called unexpected tools (policy enforced)");
+        }
+        if result.mcp_error_count > 0 {
+            println!("    - the place_order call returned an MCP error");
+        }
+        if !result.expected_reads_complete {
+            println!("    - place_order was not called exactly once");
+        }
+        println!("    - submit_failed recorded in the audit log");
     }
     Ok(())
 }
