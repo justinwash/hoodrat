@@ -121,6 +121,8 @@ pub enum BrokerPayload {
     },
     Pnl(PnlSnapshot),
     PnlTradeHistory(Vec<PnlTradeRecord>),
+    Positions(Vec<PositionRecord>),
+    Orders(Vec<ExecutionRecord>),
 }
 
 pub trait BrokerDataSink {
@@ -483,6 +485,16 @@ pub fn parse_broker_payload(tool_name: &str, raw: &Value) -> Result<BrokerPayloa
         "get_pnl_trade_history" => {
             PnlTradeRecord::from_value(raw, None).map(BrokerPayload::PnlTradeHistory)
         }
+        "get_equity_positions" | "get_option_positions" => {
+            let payload = normalize_mcp_payload(raw)?;
+            let captured_at = Utc::now().to_rfc3339();
+            Ok(BrokerPayload::Positions(parse_positions(
+                &payload,
+                &captured_at,
+                None,
+            )))
+        }
+        "get_equity_orders" | "get_option_orders" => Ok(BrokerPayload::Orders(parse_orders(raw)?)),
         _ => anyhow::bail!("unsupported typed broker tool: {tool_name}"),
     }
 }
@@ -698,6 +710,28 @@ fn parse_positions(
             }
         })
         .collect()
+}
+
+/// Parse an array of orders from a `get_*_orders` MCP response into execution
+/// records. Each object is normalized through `ExecutionRecord::from_value`
+/// individually so a malformed entry never aborts the whole batch.
+fn parse_orders(raw: &Value) -> Result<Vec<ExecutionRecord>> {
+    let payload = normalize_mcp_payload(raw)?;
+    let array = find_array(
+        &payload,
+        &["orders", "results", "order_history", "orders_history"],
+    )
+    .cloned()
+    .unwrap_or_default();
+    let mut records = Vec::new();
+    for item in array.into_iter().take(500) {
+        if let Ok(record) = ExecutionRecord::from_value(&Value::Object(
+            item.as_object().cloned().unwrap_or_default(),
+        )) {
+            records.push(record);
+        }
+    }
+    Ok(records)
 }
 
 fn payload_object(value: &Value) -> Option<&Map<String, Value>> {

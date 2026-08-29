@@ -1,7 +1,7 @@
 use crate::config::{AgentConfig, RiskConfig, StrategyContract};
 use crate::ingestion::{
-    parse_json_text, single_agentic_account, BrokerDataSink, BrokerPayload, ExecutionRecord,
-    PortfolioSnapshot,
+    parse_broker_payload, parse_json_text, single_agentic_account, BrokerDataSink, BrokerPayload,
+    ExecutionRecord, PortfolioSnapshot,
 };
 use crate::store::{AgentEventRecord, AgentToolEventRecord, ReconciliationReport, Store};
 use anyhow::{Context, Result};
@@ -135,7 +135,11 @@ impl AgentCommand {
                 line.push(' ');
                 line.push_str(a);
             }
-            eprintln!("[spawn] exec='{}' argv_len={}", executable.display(), line.len());
+            eprintln!(
+                "[spawn] exec='{}' argv_len={}",
+                executable.display(),
+                line.len()
+            );
         }
         let settings_guard = if self.restrict_local_tools {
             Some(prepare_read_only_cline_tools(&self.cline_data_dir)?)
@@ -1312,6 +1316,26 @@ fn ingest_tool_output(
                 "portfolio_ingested",
                 &serde_json::json!({"tool_name": tool_name}),
             )?;
+        }
+    }
+    if lower_name.contains("position") || lower_name.contains("order") {
+        // Route positions/orders through the typed broker ingestion path so they
+        // are parsed consistently and persisted to broker_positions / executions.
+        if let Ok(payload) = parse_broker_payload(tool_name, output) {
+            let count = match &payload {
+                BrokerPayload::Positions(values) => values.len(),
+                BrokerPayload::Orders(values) => values.len(),
+                _ => 0,
+            };
+            if count > 0 {
+                store.ingest_typed_broker_payload(tool_name, output)?;
+                store.record_audit(
+                    Some(run_id),
+                    "broker_data",
+                    "positions_or_orders_ingested",
+                    &serde_json::json!({"tool_name": tool_name, "count": count}),
+                )?;
+            }
         }
     }
     if lower_name.contains("order")

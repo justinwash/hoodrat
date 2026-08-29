@@ -19,6 +19,7 @@ const TYPED_BROKER_MIGRATION: &str = include_str!("../migrations/004_typed_broke
 const STRATEGY_BASELINE_MIGRATION: &str =
     include_str!("../migrations/005_strategy_and_baseline_acceptance.sql");
 const PAPER_SIMULATIONS_MIGRATION: &str = include_str!("../migrations/006_paper_simulations.sql");
+const ORDER_PROPOSALS_MIGRATION: &str = include_str!("../migrations/007_order_proposals.sql");
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RunRecord {
@@ -93,6 +94,17 @@ pub struct DashboardSnapshot {
     pub strategy_table: String,
     pub recent_events: String,
     pub simulation_table: String,
+    pub proposals_table: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProposalRow {
+    pub id: i64,
+    pub proposed_at: String,
+    pub symbol: String,
+    pub side: String,
+    pub notional_usd: f64,
+    pub verdict: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -132,6 +144,7 @@ impl Store {
         connection.execute_batch(TYPED_BROKER_MIGRATION)?;
         connection.execute_batch(STRATEGY_BASELINE_MIGRATION)?;
         connection.execute_batch(PAPER_SIMULATIONS_MIGRATION)?;
+        connection.execute_batch(ORDER_PROPOSALS_MIGRATION)?;
         ensure_column(
             &connection,
             "agent_runs",
@@ -314,6 +327,16 @@ impl Store {
                     self.insert_pnl_trade(trade)?;
                 }
             }
+            BrokerPayload::Positions(positions) => {
+                for position in positions {
+                    self.insert_position(position)?;
+                }
+            }
+            BrokerPayload::Orders(orders) => {
+                for order in orders {
+                    self.insert_execution(order, None)?;
+                }
+            }
         }
         Ok(payload)
     }
@@ -340,6 +363,12 @@ impl Store {
                 }
                 BrokerPayload::Pnl(value) => pnl_snapshots.push(value),
                 BrokerPayload::PnlTradeHistory(values) => pnl_trades.extend(values),
+                BrokerPayload::Positions(values) => positions.extend(values),
+                BrokerPayload::Orders(orders) => {
+                    for order in orders {
+                        self.insert_execution(&order, None)?;
+                    }
+                }
             }
         }
         let coverage = reconciliation_coverage(raw_payloads)?;
@@ -877,6 +906,11 @@ impl Store {
         let latest_balance = balances.first();
         let cash = latest_balance.and_then(|b| b.cash_usd);
         let equity = latest_balance.and_then(|b| b.equity_usd);
+        let buying_power = metrics
+            .1
+            .or_else(|| latest_balance.and_then(|b| b.buying_power_usd))
+            .or_else(|| latest_balance.and_then(|b| b.unleveraged_buying_power_usd));
+        let effective_metrics = (metrics.0, buying_power, metrics.2);
 
         Ok(DashboardSnapshot {
             bot_status: "—".to_owned(),
@@ -892,7 +926,7 @@ impl Store {
                 .map(|run| run.status.clone())
                 .unwrap_or_else(|| "—".to_owned()),
             portfolio_value: metrics.0,
-            buying_power: metrics.1,
+            buying_power,
             cash,
             equity,
             realized_pnl: metrics.2,
@@ -908,7 +942,7 @@ impl Store {
             equity_chart_path,
             equity_chart_labels,
             pnl_chart_path,
-            overview_stats: self.overview_stats(metrics, cash, equity)?,
+            overview_stats: self.overview_stats(effective_metrics, cash, equity)?,
             accounts_table: self.accounts_table()?,
             balances_table: self.balances_table()?,
             positions_table: self.positions_table()?,
@@ -926,6 +960,7 @@ impl Store {
                 recent_events
             },
             simulation_table: self.simulation_table()?,
+            proposals_table: self.proposals_table()?,
         })
     }
 
@@ -983,7 +1018,9 @@ impl Store {
             let cmd = if i == 0 { "M" } else { "L" };
             parts.push(format!("{cmd}{:.4} {:.4}", x * 100.0, y * 100.0));
         }
-        let path = format!("M0 100 {}", parts.join(" "));
+        // Close the line against the bottom edge so the UI can render a
+        // readable filled-area chart without a second data series.
+        let path = format!("{} L100 100 L0 100 Z", parts.join(" "));
         let labels = format!(
             "low {:.2}  ·  high {:.2}  ·  points {}",
             min,
@@ -1402,6 +1439,143 @@ impl Store {
         }
         Ok(s)
     }
+    pub fn record_order_proposal(
+        &self,
+        proposal: &crate::firewall::OrderProposal,
+        run_id: Option<&str>,
+        verdict: &crate::firewall::FirewallVerdict,
+    ) -> Result<i64> {
+        self.connection.execute(
+            "INSERT INTO order_proposals (proposed_at, run_id, account_number, asset_class, symbol, side, order_type, quantity, notional_usd, limit_price, quote_age_secs, source, verdict, reasons_json, proposal_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            params![
+                now(),
+                run_id,
+                proposal.account_number,
+                proposal.asset_class,
+                proposal.symbol,
+                proposal.side,
+                proposal.order_type,
+                proposal.quantity,
+                proposal.notional_usd,
+                proposal.limit_price,
+                Option::<i64>::None,
+                proposal.source,
+                if verdict.approved { "approved" } else { "blocked" },
+                serde_json::to_string(&verdict.reasons)?,
+                serde_json::to_string(proposal)?,
+            ],
+        )?;
+        Ok(self.connection.last_insert_rowid())
+    }
+
+    pub fn pending_proposals(&self, limit: u32) -> Result<Vec<ProposalRow>> {
+        let mut stmt = self.connection.prepare(
+            "SELECT id, proposed_at, symbol, side, notional_usd, verdict FROM order_proposals ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit], |row| {
+            Ok(ProposalRow {
+                id: row.get(0)?,
+                proposed_at: row.get(1)?,
+                symbol: row.get(2)?,
+                side: row.get(3)?,
+                notional_usd: row.get(4)?,
+                verdict: row.get(5)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn has_recent_proposal(
+        &self,
+        symbol: &str,
+        side: &str,
+        cooldown_secs: u64,
+    ) -> Result<bool> {
+        let cutoff = chrono::Utc::now()
+            .checked_sub_signed(chrono::Duration::seconds(cooldown_secs as i64))
+            .map(|t| t.to_rfc3339())
+            .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_owned());
+        self.connection
+            .query_row(
+                "SELECT COUNT(*) FROM order_proposals WHERE symbol = ?1 AND side = ?2 AND proposed_at >= ?3 AND verdict = 'approved'",
+                params![symbol, side, cutoff],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|count| count > 0)
+            .map_err(Into::into)
+    }
+
+    pub fn latest_realized_pnl_usd(&self) -> Result<Option<f64>> {
+        self.connection
+            .query_row(
+                "SELECT realized_pnl_usd FROM broker_pnl_snapshots WHERE realized_pnl_usd IS NOT NULL ORDER BY rowid DESC LIMIT 1",
+                [],
+                |row| row.get::<_, Option<f64>>(0),
+            )
+            .optional()
+            .map(|v| v.flatten())
+            .map_err(Into::into)
+    }
+
+    pub fn latest_equity_usd(&self) -> Result<Option<f64>> {
+        Ok(self.balance_history(1)?.first().and_then(|b| b.equity_usd))
+    }
+
+    pub fn latest_cash_usd(&self) -> Result<Option<f64>> {
+        Ok(self.balance_history(1)?.first().and_then(|b| b.cash_usd))
+    }
+
+    pub fn latest_buying_power_usd(&self) -> Result<Option<f64>> {
+        Ok(self
+            .balance_history(1)?
+            .first()
+            .and_then(|b| b.buying_power_usd))
+    }
+
+    pub fn proposals_table(&self) -> Result<String> {
+        let mut stmt = self.connection.prepare(
+            "SELECT id, proposed_at, symbol, side, notional_usd, verdict, substr(reasons_json,1,80) FROM order_proposals ORDER BY id DESC LIMIT 40",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, f64>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+            ))
+        })?;
+        let mut s =
+            String::from("ID   TIME                SYMBOL  SIDE   NOTIONAL  VERDICT   DETAIL\n");
+        for r in rows {
+            let (id, at, symbol, side, notional, verdict, reasons) = r?;
+            s.push_str(&format!(
+                "{:<4} {:<19} {:<7} {:<6} {:<9} {:<9} {}\n",
+                id,
+                short_ts(&at),
+                symbol,
+                side,
+                fmt_money(Some(notional)),
+                verdict,
+                if reasons.trim().is_empty() || reasons.trim() == "[]" {
+                    "—"
+                } else {
+                    &reasons
+                }
+            ));
+        }
+        Ok(s)
+    }
+
+    pub fn ping_proposals(&self) -> rusqlite::Result<i64> {
+        self.connection
+            .query_row("SELECT COUNT(*) FROM order_proposals", [], |row| {
+                row.get::<_, i64>(0)
+            })
+    }
 }
 
 impl BrokerDataSink for Store {
@@ -1423,7 +1597,7 @@ fn parse_json(text: String) -> Value {
 }
 
 /// Truncate an ISO timestamp to seconds-without-timezone for compact display.
-fn short_ts(ts: &str) -> String {
+pub(crate) fn short_ts(ts: &str) -> String {
     // e.g. 2026-08-28T13:31:48.634662100+00:00 -> 2026-08-28 13:31:48
     let body = ts.split('.').next().unwrap_or(ts);
     body.replace('T', " ")
@@ -1438,7 +1612,7 @@ fn short_id(id: &str) -> String {
     }
 }
 
-fn fmt_money(value: Option<f64>) -> String {
+pub(crate) fn fmt_money(value: Option<f64>) -> String {
     value
         .map(|v| format!("${v:.2}"))
         .unwrap_or_else(|| "—".to_owned())
@@ -1648,7 +1822,7 @@ mod tests {
             .record_audit(None, "test", "created", &serde_json::json!({"ok": true}))
             .unwrap();
         assert!(store.latest_run().unwrap().is_none());
-        assert_eq!(store.schema_version().unwrap(), 7);
+        assert_eq!(store.schema_version().unwrap(), 8);
     }
 
     #[test]
@@ -1941,7 +2115,7 @@ mod tests {
         }
         {
             let store = Store::open(&path).unwrap();
-            assert_eq!(store.schema_version().unwrap(), 7);
+            assert_eq!(store.schema_version().unwrap(), 8);
             let baseline_table_exists: u32 = store
                 .connection
                 .query_row(

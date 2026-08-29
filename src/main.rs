@@ -1,5 +1,6 @@
 mod agent;
 mod config;
+mod firewall;
 mod ingestion;
 mod readiness;
 mod scheduler;
@@ -13,7 +14,7 @@ use agent::{
 use anyhow::{Context, Result};
 use chrono::Utc;
 use clap::{Parser, Subcommand};
-use config::{default_config_path, Config};
+use config::{default_config_path, Config, SizingMode};
 use readiness::{check, ReadinessReport};
 use scheduler::{
     run as run_scheduler, run_from_path as run_scheduler_from_path,
@@ -24,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use store::{DashboardSnapshot, Store};
+use store::{fmt_money, short_ts, DashboardSnapshot, Store};
 
 slint::include_modules!();
 
@@ -77,6 +78,32 @@ enum CommandKind {
     App,
     /// Open the local Slint monitoring dashboard.
     Dashboard,
+    /// Inspect the pre-trade firewall: show recent order proposals/verdicts.
+    Gate,
+    /// Evaluate and record an order proposal through the firewall.
+    Propose {
+        /// Asset class (equity|option).
+        #[arg(long, default_value = "equity")]
+        asset_class: String,
+        /// Symbol (e.g. SPY).
+        #[arg(long, required = true)]
+        symbol: String,
+        /// Side (buy|sell|buy_to_open|...).
+        #[arg(long, required = true)]
+        side: String,
+        /// Order notional in USD.
+        #[arg(long, required = true)]
+        notional: f64,
+        /// Quantity (optional).
+        #[arg(long)]
+        quantity: Option<f64>,
+        /// Limit price (optional).
+        #[arg(long)]
+        limit_price: Option<f64>,
+        /// Do not prompt for confirmation when recording.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -96,6 +123,25 @@ fn main() -> Result<()> {
         CommandKind::Run { once } => run(cli.config, once),
         CommandKind::App => app(cli.config),
         CommandKind::Dashboard => dashboard(cli.config),
+        CommandKind::Gate => gate(&cli.config),
+        CommandKind::Propose {
+            asset_class,
+            symbol,
+            side,
+            notional,
+            quantity,
+            limit_price,
+            yes,
+        } => propose(
+            &cli.config,
+            &asset_class,
+            &symbol,
+            &side,
+            notional,
+            quantity,
+            limit_price,
+            yes,
+        ),
     }
 }
 
@@ -531,6 +577,125 @@ fn run(config_path: PathBuf, once: bool) -> Result<()> {
     run_scheduler_from_path(&config_path, once)
 }
 
+fn gate(config_path: &Path) -> Result<()> {
+    let (config, store) = load_runtime(config_path)?;
+    firewall::connectivity_check(&store)?;
+    println!("Hoodrat order firewall");
+    println!("  execution:       {:?}", config.execution.mode);
+    println!(
+        "  kill switch:     {}",
+        if config.execution.kill_switch_engaged {
+            "engaged"
+        } else {
+            "released"
+        }
+    );
+    println!(
+        "  gateway submit:  {}",
+        if config.gateway.submit {
+            "ENABLED"
+        } else {
+            "disabled (safe)"
+        }
+    );
+    println!(
+        "  operator approval: {}",
+        if config.gateway.require_operator_approval {
+            "required"
+        } else {
+            "not required"
+        }
+    );
+    println!("\nRecent proposals:");
+    let proposals = store.pending_proposals(20)?;
+    if proposals.is_empty() {
+        println!("  (none recorded yet)\n");
+    } else {
+        for row in proposals {
+            println!(
+                "  #{:<4} {:<19} {:<7} {:<10} {:<9} {}",
+                row.id,
+                short_ts(&row.proposed_at),
+                row.symbol,
+                row.side,
+                fmt_money(Some(row.notional_usd)),
+                row.verdict
+            );
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn propose(
+    config_path: &Path,
+    asset_class: &str,
+    symbol: &str,
+    side: &str,
+    notional: f64,
+    quantity: Option<f64>,
+    limit_price: Option<f64>,
+    yes: bool,
+) -> Result<()> {
+    let (config, store) = load_runtime(config_path)?;
+    let proposal = firewall::OrderProposal {
+        account_number: None,
+        asset_class: asset_class.to_owned(),
+        symbol: symbol.to_uppercase(),
+        side: side.to_owned(),
+        order_type: "limit".to_owned(),
+        quantity,
+        notional_usd: notional,
+        limit_price,
+        quote_price: None,
+        quote_captured_at: None,
+        source: "cli".to_owned(),
+    };
+    if !yes {
+        println!(
+            "Proposed order: {} {} {} @ ~${:.2}",
+            side,
+            symbol.to_uppercase(),
+            asset_class,
+            notional
+        );
+    }
+    let verdict = firewall::evaluate(&config, &store, &proposal)?;
+    let id = store.record_order_proposal(&proposal, None, &verdict)?;
+    store.record_audit(
+        None,
+        "firewall",
+        if verdict.approved {
+            "approved"
+        } else {
+            "blocked"
+        },
+        &serde_json::json!({
+            "symbol": proposal.symbol,
+            "side": proposal.side,
+            "notional_usd": proposal.notional_usd,
+            "verdict": if verdict.approved { "approved" } else { "blocked" },
+            "reasons": verdict.reasons,
+        }),
+    )?;
+    if verdict.approved {
+        println!(
+            "  verdict: APPROVED (proposal #{id}) {}",
+            if verdict.submitted {
+                "— submit enabled"
+            } else {
+                "— not submitted (gateway.submit=false)"
+            }
+        );
+    } else {
+        println!("  verdict: BLOCKED (proposal #{id})");
+        for reason in &verdict.reasons {
+            println!("    - {reason}");
+        }
+    }
+    Ok(())
+}
+
 fn app(config_path: PathBuf) -> Result<()> {
     let stop = Arc::new(AtomicBool::new(false));
     let scheduler_path = config_path.clone();
@@ -647,6 +812,21 @@ fn apply_snapshot(
     window.set_last_run(snapshot.last_run.clone().into());
     window.set_last_run_status(snapshot.last_run_status.clone().into());
     window.set_database_path(snapshot.database_path.clone().into());
+    window.set_market_session(market_session_label(config).into());
+    window.set_last_refresh(Utc::now().format("%H:%M:%S UTC").to_string().into());
+    window.set_max_order_notional(format_money(Some(config.risk.max_order_notional_usd)).into());
+    window.set_daily_loss_cap(format_money(Some(config.risk.daily_loss_limit_usd)).into());
+    window.set_max_exposure(format_money(Some(config.risk.max_total_exposure_usd)).into());
+    window.set_sizing_mode(sizing_label(config).into());
+    window.set_leverage_status(
+        if config.strategy.allow_leverage {
+            "enabled"
+        } else {
+            "disabled"
+        }
+        .into(),
+    );
+    window.set_symbol_scope(symbol_scope(config).into());
     window.set_recent_events(snapshot.recent_events.clone().into());
     window.set_equity_chart_path(snapshot.equity_chart_path.clone().into());
     window.set_equity_chart_labels(snapshot.equity_chart_labels.clone().into());
@@ -664,6 +844,50 @@ fn apply_snapshot(
     window.set_baseline_acceptances_table(snapshot.baseline_acceptances_table.clone().into());
     window.set_strategy_table(config.strategy.summary().into());
     window.set_simulation_table(snapshot.simulation_table.clone().into());
+    window.set_proposals_table(snapshot.proposals_table.clone().into());
+}
+
+fn sizing_label(config: &Config) -> String {
+    match config.strategy.sizing_mode {
+        SizingMode::FixedNotional => "fixed notional".to_owned(),
+        SizingMode::AvailableBalance => "available balance".to_owned(),
+    }
+}
+
+fn symbol_scope(config: &Config) -> String {
+    if config.strategy.allows_any_symbol() {
+        "*  unrestricted".to_owned()
+    } else if config.strategy.approved_symbols.is_empty() {
+        "none approved".to_owned()
+    } else {
+        config.strategy.approved_symbols.join(", ")
+    }
+}
+
+fn market_session_label(config: &Config) -> String {
+    let timezone = config
+        .schedule
+        .equity_options
+        .timezone
+        .parse::<chrono_tz::Tz>()
+        .ok();
+    let start =
+        chrono::NaiveTime::parse_from_str(&config.schedule.equity_options.start_local, "%H:%M")
+            .ok();
+    let end =
+        chrono::NaiveTime::parse_from_str(&config.schedule.equity_options.end_local, "%H:%M").ok();
+    let is_open = match (timezone, start, end) {
+        (Some(timezone), Some(start), Some(end)) => {
+            let local_time = Utc::now().with_timezone(&timezone).time();
+            config.schedule.equity_options.enabled && local_time >= start && local_time <= end
+        }
+        _ => false,
+    };
+    if is_open {
+        "● MARKET OPEN · 09:35—15:55 ET".to_owned()
+    } else {
+        "○ MARKET CLOSED · 09:35—15:55 ET".to_owned()
+    }
 }
 fn format_money(value: Option<f64>) -> String {
     value

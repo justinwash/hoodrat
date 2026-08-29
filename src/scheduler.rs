@@ -250,6 +250,42 @@ fn run_lane(config: &Config, store: &Store, lane: Lane) -> Result<()> {
         result.event_count,
         result.tool_event_count,
     );
+    // Feed any machine-readable trade decision from the run through the
+    // pre-trade firewall. In the safe (default) posture this records an
+    // approved/blocked verdict but never submits.
+    if let Some(proposal) =
+        crate::firewall::proposal_from_decision(&result.raw_output, lane.as_str(), "agent", 25.0)
+    {
+        let verdict = crate::firewall::evaluate(config, store, &proposal)?;
+        store.record_order_proposal(&proposal, Some(&result.run_id), &verdict)?;
+        store.record_audit(
+            Some(&result.run_id),
+            "firewall",
+            if verdict.approved {
+                "approved"
+            } else {
+                "blocked"
+            },
+            &serde_json::json!({
+                "symbol": proposal.symbol,
+                "side": proposal.side,
+                "notional_usd": proposal.notional_usd,
+                "submitted": verdict.submitted,
+                "reasons": verdict.reasons,
+            }),
+        )?;
+        println!(
+            "  firewall: {} {} {} — {}",
+            proposal.side,
+            proposal.symbol,
+            proposal.asset_class,
+            if verdict.approved {
+                "APPROVED (not submitted)"
+            } else {
+                "BLOCKED"
+            }
+        );
+    }
     Ok(())
 }
 

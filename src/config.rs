@@ -50,6 +50,8 @@ pub struct Config {
     #[serde(default)]
     pub robinhood: RobinhoodConfig,
     #[serde(default)]
+    pub gateway: GatewayConfig,
+    #[serde(default)]
     pub schedule: ScheduleConfig,
     #[serde(default)]
     pub risk: RiskConfig,
@@ -252,6 +254,28 @@ fn is_read_only_market_tool_name(tool: &str) -> bool {
             .iter()
             .any(|prefix| operation.starts_with(prefix))
     })
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GatewayConfig {
+    /// If true, a fully-approved proposal may be submitted to the broker by
+    /// the execution path. If false (the default), proposals are evaluated and
+    /// recorded but never submitted — this is the safe, supervised posture.
+    #[serde(default)]
+    pub submit: bool,
+    /// If true, approved proposals require an explicit operator approval
+    /// record before any submission path considers them executable.
+    #[serde(default = "default_true")]
+    pub require_operator_approval: bool,
+}
+
+impl Default for GatewayConfig {
+    fn default() -> Self {
+        Self {
+            submit: false,
+            require_operator_approval: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -599,6 +623,7 @@ impl Default for Config {
             execution: ExecutionConfig::default(),
             agent: AgentConfig::default(),
             robinhood: RobinhoodConfig::default(),
+            gateway: GatewayConfig::default(),
             schedule: ScheduleConfig::default(),
             risk: RiskConfig::default(),
             strategy: StrategyContract::default(),

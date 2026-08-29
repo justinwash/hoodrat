@@ -21,6 +21,10 @@
     "agentic_account_only": true,
     "connection_ready": false
   },
+  "gateway": {
+    "submit": false,
+    "require_operator_approval": true
+  },
   "schedule": {
     "equity_options": {
       "enabled": true,

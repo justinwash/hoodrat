@@ -1,52 +1,199 @@
 import { Button, GroupBox, HorizontalBox, ScrollView, TabWidget, VerticalBox } from "std-widgets.slint";
 
-// ── Reusable components (must be declared before use) ─────────────
+// Hoodrat Terminal — a compact personal trading cockpit inspired by the
+// reference layout: navigation rail, dominant analytics workspace, control
+// center, and dense operational tables.
+
+component NavItem inherits Rectangle {
+    in property <string> label: "";
+    in property <string> glyph: "";
+    in property <bool> active: false;
+    callback selected();
+
+    height: 34px;
+    border-radius: 5px;
+    background: active ? #123b3a : transparent;
+    border-width: active ? 1px : 0px;
+    border-color: #16c79a;
+
+    HorizontalBox {
+        padding: 8px;
+        spacing: 9px;
+        Text { text: glyph; color: active ? #4adeb4 : #728096; font-size: 12px; width: 16px; horizontal-alignment: center; }
+        Text { text: label; color: active ? #d8fff3 : #9aa7b8; font-size: 12px; vertical-alignment: center; }
+    }
+    TouchArea { clicked => { root.selected(); } }
+}
+
+component SectionLabel inherits Text {
+    color: #526176;
+    font-size: 10px;
+    font-weight: 700;
+}
+
 component KpiCard inherits Rectangle {
-    in property <string> title: "";
+    in property <string> label: "";
     in property <string> value: "—";
-    in property <brush> accent: #22d3ee;
-    border-radius: 10px;
-    background: #111827;
-    border-width: 1px;
-    border-color: #1f2937;
-    height: 74px;
+    in property <string> detail: "";
+    in property <brush> accent: #19d3ae;
+    in property <bool> negative: false;
+
+    height: 78px;
     horizontal-stretch: 1;
+    border-radius: 7px;
+    background: #111b29;
+    border-width: 1px;
+    border-color: #1d2a3b;
+
     VerticalBox {
         padding: 10px;
         spacing: 4px;
-        Text { text: title; color: #9ca3af; font-size: 11px; }
-        Text { text: value; color: accent; font-size: 18px; font-weight: 700; }
+        Text { text: label; color: #718096; font-size: 10px; font-weight: 700; }
+        Text { text: value; color: accent; font-size: 20px; font-weight: 700; }
+        Text { text: detail; color: negative ? #f87171 : #6f8096; font-size: 10px; }
     }
 }
 
-component ChartCard inherits Rectangle {
-    in property <string> path: "";
-    border-radius: 6px;
-    background: #0f172a;
+component StatusPill inherits Rectangle {
+    in property <string> label: "UNKNOWN";
+    in property <bool> good: false;
+    in property <bool> warning: false;
+    width: 112px;
+    height: 28px;
+    border-radius: 14px;
+    background: good ? #08382f : warning ? #3a2b0c : #2a1720;
     border-width: 1px;
-    border-color: #1e293b;
-    Path {
-        width: 100%;
-        height: 100%;
-        commands: path;
-        fill: #0f172a;
-        stroke: #22d3ee;
-        stroke-width: 1.5px;
+    border-color: good ? #16c79a : warning ? #d69e2e : #ef5350;
+    Text {
+        text: label;
+        width: 112px;
+        height: 28px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        color: good ? #5ee6bd : warning ? #f5c451 : #ff817d;
+        font-size: 10px;
+        font-weight: 700;
     }
 }
 
-component TableTab inherits GroupBox {
+component PanelTitle inherits HorizontalBox {
+    in property <string> label: "";
+    height: 35px;
+    padding: 10px;
+    spacing: 8px;
+    Text { text: label; color: #d7e2ef; font-size: 12px; font-weight: 700; }
+    Rectangle { horizontal-stretch: 1; }
+    Text { text: "···"; color: #526176; font-size: 15px; }
+}
+
+component TablePanel inherits Rectangle {
+    in property <string> label: "";
     in property <string> contents: "";
-    ScrollView {
-        width: 100%;
-        height: 100%;
-        viewport-width: 900px;
-        viewport-height: 520px;
-        Text { text: contents; color: #d1d5db; font-size: 13px; }
+    background: #101927;
+    border-radius: 7px;
+    border-width: 1px;
+    border-color: #1d2a3b;
+
+    VerticalBox {
+        PanelTitle { label: root.label; }
+        Rectangle { height: 1px; background: #1d2a3b; }
+        ScrollView {
+            width: 100%;
+            height: 100%;
+            viewport-width: 980px;
+            viewport-height: 460px;
+            Text {
+                text: root.contents;
+                color: #b7c4d4;
+                font-family: "monospace";
+                font-size: 12px;
+                wrap: word-wrap;
+            }
+        }
     }
+}
+
+component ChartPanel inherits Rectangle {
+    in property <string> label: "";
+    in property <string> path: "";
+    in property <string> range: "";
+    in property <string> headline: "";
+    in property <string> subhead: "";
+    in property <brush> stroke: #24d6b0;
+    background: #101927;
+    border-radius: 7px;
+    border-width: 1px;
+    border-color: #1d2a3b;
+
+    VerticalBox {
+        PanelTitle { label: root.label; }
+        Rectangle { height: 1px; background: #1d2a3b; }
+        HorizontalBox {
+            height: headline == "" ? 0px : 38px;
+            padding: 7px;
+            padding-left: 10px;
+            padding-right: 10px;
+            spacing: 8px;
+            Text { text: headline; color: #e5fef7; font-size: 18px; font-weight: 700; }
+            Text { text: subhead; color: #718096; font-size: 10px; vertical-alignment: center; }
+        }
+        Rectangle {
+            vertical-stretch: 1;
+            background: #0d1724;
+            border-radius: 5px;
+            border-width: 1px;
+            border-color: #182638;
+            // The Rust path is normalized to this fixed terminal viewbox.
+            // Keeping the viewbox explicit prevents the plot from collapsing
+            // into the implicit bounds of a short or sparse history series.
+            Path {
+                width: 100%;
+                height: 100%;
+                commands: "M0 25 L100 25 M0 50 L100 50 M0 75 L100 75 M25 0 L25 100 M50 0 L50 100 M75 0 L75 100";
+                viewbox-x: 0;
+                viewbox-y: 0;
+                viewbox-width: 100;
+                viewbox-height: 100;
+                fill: transparent;
+                stroke: #172536;
+                stroke-width: 0.45px;
+                clip: true;
+            }
+            Path {
+                width: 100%;
+                height: 100%;
+                commands: root.path;
+                viewbox-x: 0;
+                viewbox-y: 0;
+                viewbox-width: 100;
+                viewbox-height: 100;
+                fill: root.path == "" ? transparent : #123b3a;
+                stroke: root.stroke;
+                stroke-width: 1.6px;
+                clip: true;
+            }
+            Text { text: root.path == "" ? "NO STORED HISTORY" : "STORED ACCOUNT HISTORY"; x: 12px; y: 10px; color: #64748b; font-size: 9px; font-weight: 700; }
+            Text { text: "100"; x: 4px; y: 3px; color: #4e6279; font-size: 8px; }
+            Text { text: "0"; x: 7px; y: 76px; color: #4e6279; font-size: 8px; }
+        }
+        Text { text: root.range; color: #8291a5; font-size: 10px; }
+    }
+}
+
+component ControlRow inherits HorizontalBox {
+    in property <string> label: "";
+    in property <string> value: "—";
+    in property <brush> value-color: #d7e2ef;
+    padding: 7px;
+    padding-left: 10px;
+    padding-right: 10px;
+    spacing: 8px;
+    Text { text: label; color: #8291a5; font-size: 10px; horizontal-stretch: 1; }
+    Text { text: value; color: value-color; font-size: 11px; font-weight: 700; }
 }
 
 export component MainWindow inherits Window {
+    in-out property <int> selected_page: 0;
     in property <string> bot_status: "UNKNOWN";
     in property <string> execution_mode: "disabled";
     in property <string> risk_status: "Not confirmed";
@@ -61,6 +208,14 @@ export component MainWindow inherits Window {
     in property <string> last_run: "No runs recorded";
     in property <string> last_run_status: "—";
     in property <string> database_path: "—";
+    in property <string> market_session: "MARKET UNKNOWN";
+    in property <string> last_refresh: "—";
+    in property <string> max_order_notional: "—";
+    in property <string> daily_loss_cap: "—";
+    in property <string> max_exposure: "—";
+    in property <string> sizing_mode: "—";
+    in property <string> leverage_status: "—";
+    in property <string> symbol_scope: "—";
     in property <string> recent_events: "No agent events recorded.";
     in property <string> equity_chart_path: "";
     in property <string> equity_chart_labels: "";
@@ -78,129 +233,201 @@ export component MainWindow inherits Window {
     in property <string> baseline_acceptances_table: "";
     in property <string> strategy_table: "";
     in property <string> simulation_table: "";
+    in property <string> proposals_table: "";
     callback run_now();
     callback refresh();
     callback toggle_kill_switch();
 
-    min-width: 1180px;
-    min-height: 720px;
-    background: #0b0e14;
+    title: "HOODRAT TERMINAL";
+    width: 1360px;
+    height: 820px;
+    background: #080d14;
 
-    VerticalBox {
-        padding: 14px;
-        spacing: 12px;
-
-        HorizontalBox {
-            spacing: 14px;
-            Text { text: "HOODRAT"; color: #22d3ee; font-size: 26px; font-weight: 900; letter-spacing: 1px; }
-            Text { text: "agentic trading supervisor"; color: #6b7280; vertical-alignment: center; font-size: 13px; }
-            Rectangle { horizontal-stretch: 1; }
-            Rectangle {
-                border-radius: 12px;
-                background: root.bot_status == "LIVE READY" ? #052e24 : root.bot_status == "LOCKED" ? #3b0f13 : #111827;
-                border-width: 1px;
-                border-color: root.bot_status == "LIVE READY" ? #10b981 : root.bot_status == "LOCKED" ? #ef4444 : #374151;
-                height: 30px;
-                width: 110px;
-                Text { text: root.bot_status; color: root.bot_status == "LIVE READY" ? #34d399 : root.bot_status == "LOCKED" ? #f87171 : #9ca3af; font-weight: 700; x: 0; y: 0; width: 110px; horizontal-alignment: center; vertical-alignment: center; }
-            }
-            Text { text: root.execution_mode; color: #d1d5db; vertical-alignment: center; font-size: 13px; }
-            Button { text: "Refresh"; clicked => { root.refresh(); } }
-            Button { text: "Run evaluation"; clicked => { root.run_now(); } }
-            Button { text: "Kill switch"; clicked => { root.toggle_kill_switch(); } }
-        }
-
-        HorizontalBox {
-            spacing: 12px;
-            KpiCard { title: "Total equity"; value: root.equity; accent: #22d3ee; }
-            KpiCard { title: "Cash"; value: root.cash; accent: #a3e635; }
-            KpiCard { title: "Buying power"; value: root.buying_power; accent: #60a5fa; }
-            KpiCard { title: "Realized PnL"; value: root.realized_pnl; accent: #34d399; }
-            KpiCard { title: "Unrealized PnL"; value: root.unrealized_pnl; accent: #fbbf24; }
-        }
-
+    HorizontalBox {
+        // ── Persistent navigation rail ───────────────────────────
         Rectangle {
-            border-radius: 8px;
-            background: #111827;
+            width: 218px;
+            background: #0d1420;
             border-width: 1px;
-            border-color: root.reconciliation_status == "reconciled" ? #10b981 : root.reconciliation_status == "drift_detected" ? #fbbf24 : #374151;
-            height: 44px;
-            HorizontalBox {
-                padding: 10px;
-                spacing: 12px;
-                Text { text: "Reconciliation:"; color: #9ca3af; font-size: 12px; vertical-alignment: center; }
-                Text {
-                    text: root.reconciliation_status;
-                    color: root.reconciliation_status == "reconciled" ? #34d399 : root.reconciliation_status == "drift_detected" ? #fbbf24 : #f87171;
-                    font-weight: 700;
+            border-color: #1c293a;
+            VerticalBox {
+                padding: 15px;
+                padding-left: 12px;
+                padding-right: 12px;
+                spacing: 8px;
+                HorizontalBox {
+                    height: 40px;
+                    spacing: 9px;
+                    Text { text: "◈"; color: #22d3b0; font-size: 25px; vertical-alignment: center; }
+                    VerticalBox {
+                        spacing: 0px;
+                        Text { text: "HOODRAT"; color: #e5fef7; font-size: 17px; font-weight: 900; }
+                        Text { text: "PRIVATE TERMINAL"; color: #527084; font-size: 8px; font-weight: 700; }
+                    }
                 }
-                Text { text: root.reconciliation_details; color: #d1d5db; font-size: 12px; vertical-alignment: center; }
+                Rectangle { height: 1px; background: #1d2a3b; }
+
+                Rectangle {
+                    height: 86px;
+                    border-radius: 6px;
+                    background: #101d2b;
+                    border-width: 1px;
+                    border-color: #213348;
+                    VerticalBox {
+                        padding: 9px;
+                        spacing: 5px;
+                        HorizontalBox {
+                            Text { text: "AGENTIC ACCOUNT"; color: #61758d; font-size: 9px; font-weight: 700; }
+                            Rectangle { horizontal-stretch: 1; }
+                            Text { text: "⌄"; color: #61758d; font-size: 12px; }
+                        }
+                        Text { text: "Robinhood"; color: #d7e2ef; font-size: 12px; font-weight: 700; }
+                        HorizontalBox {
+                            Text { text: root.equity; color: #22d3b0; font-size: 16px; font-weight: 700; }
+                            Rectangle { horizontal-stretch: 1; }
+                            Text { text: root.reconciliation_status == "reconciled" ? "● synced" : "● review"; color: root.reconciliation_status == "reconciled" ? #34d399 : #fbbf24; font-size: 9px; vertical-alignment: center; }
+                        }
+                    }
+                }
+
+                SectionLabel { text: "WORKSPACE"; }
+                NavItem { label: "Overview"; glyph: "⌂"; active: root.selected_page == 0; selected => { root.selected_page = 0; } }
+                NavItem { label: "Portfolio"; glyph: "◒"; active: root.selected_page == 1; selected => { root.selected_page = 1; } }
+                NavItem { label: "Performance"; glyph: "↗"; active: root.selected_page == 2; selected => { root.selected_page = 2; } }
+                NavItem { label: "Agent activity"; glyph: "≋"; active: root.selected_page == 3; selected => { root.selected_page = 3; } }
+
+                SectionLabel { text: "OPERATIONS"; }
+                NavItem { label: "Risk controls"; glyph: "◎"; active: root.selected_page == 4; selected => { root.selected_page = 4; } }
+                NavItem { label: "Reconciliation"; glyph: "⟳"; active: root.selected_page == 4; selected => { root.selected_page = 4; } }
+                NavItem { label: "Simulations"; glyph: "◇"; active: root.selected_page == 5; selected => { root.selected_page = 5; } }
+
+                Rectangle { vertical-stretch: 1; }
+                Rectangle { height: 1px; background: #1d2a3b; }
+                HorizontalBox {
+                    spacing: 7px;
+                    Text { text: "●"; color: root.bot_status == "LIVE READY" ? #20d3a8 : #ef5350; font-size: 11px; }
+                    Text { text: root.bot_status == "LIVE READY" ? "SYSTEM ONLINE" : "SYSTEM LOCKED"; color: #8fa1b6; font-size: 9px; font-weight: 700; }
+                }
+                Text { text: "Direct MCP · local SQLite"; color: #4d6178; font-size: 9px; }
             }
         }
 
-        TabWidget {
-            vertical-stretch: 1;
+        // ── Main terminal workspace ──────────────────────────────
+        VerticalBox {
+            horizontal-stretch: 1;
+            padding: 14px;
+            spacing: 11px;
 
-            Tab {
-                title: "Overview";
+            HorizontalBox {
+                height: 38px;
+                spacing: 12px;
                 VerticalBox {
-                    spacing: 12px;
-                    HorizontalBox {
-                        spacing: 12px;
-                        GroupBox {
-                            title: "Equity over time";
-                            horizontal-stretch: 2;
-                            VerticalBox {
-                                spacing: 6px;
-                                ChartCard { path: root.equity_chart_path; height: 190px; }
-                                Text { text: root.equity_chart_labels; color: #6b7280; font-size: 11px; }
+                    spacing: 0px;
+                    Text { text: root.selected_page == 0 ? "Overview" : root.selected_page == 1 ? "Portfolio" : root.selected_page == 2 ? "Performance" : root.selected_page == 3 ? "Agent activity" : root.selected_page == 4 ? "Controls & reconciliation" : "Simulations"; color: #e4edf7; font-size: 19px; font-weight: 700; }
+                    Text { text: "ACCOUNT INTELLIGENCE / EXECUTION MONITOR"; color: #566b83; font-size: 8px; font-weight: 700; }
+                }
+                Rectangle { horizontal-stretch: 1; }
+                Text { text: root.market_session; color: #61758d; font-size: 10px; vertical-alignment: center; }
+                Text { text: "·"; color: #33465d; font-size: 13px; vertical-alignment: center; }
+                Text { text: "UPDATED " + root.last_refresh; color: #61758d; font-size: 9px; vertical-alignment: center; }
+                Button { text: "Run evaluation"; clicked => { root.run_now(); } }
+                Button { text: "■  Kill switch"; clicked => { root.toggle_kill_switch(); } }
+            }
+
+            HorizontalBox {
+                height: 78px;
+                spacing: 9px;
+                KpiCard { label: "NET LIQUIDATION"; value: root.equity; detail: "account equity"; accent: #28d7b2; }
+                KpiCard { label: "CASH"; value: root.cash; detail: "settled balance"; accent: #b4e66b; }
+                KpiCard { label: "BUYING POWER"; value: root.buying_power; detail: "available to deploy"; accent: #65a8f5; }
+                KpiCard { label: "REALIZED PNL"; value: root.realized_pnl; detail: "current reporting window"; accent: #46d8a5; }
+                KpiCard { label: "UNREALIZED PNL"; value: root.unrealized_pnl; detail: "mark-to-market"; accent: #f4bd55; }
+            }
+
+            TabWidget {
+                vertical-stretch: 1;
+                current-index <=> root.selected_page;
+
+                Tab {
+                    title: "Overview";
+                    VerticalBox {
+                        spacing: 10px;
+                        HorizontalBox {
+                            vertical-stretch: 1;
+                            spacing: 10px;
+                            ChartPanel { label: "PORTFOLIO EQUITY"; headline: root.equity; subhead: "account net liquidation"; path: root.equity_chart_path; range: root.equity_chart_labels; horizontal-stretch: 2; }
+                            Rectangle {
+                                width: 330px;
+                                background: #101927;
+                                border-radius: 7px;
+                                border-width: 1px;
+                                border-color: #1d2a3b;
+                                VerticalBox {
+                                    PanelTitle { label: "CONTROL CENTER"; }
+                                    Rectangle { height: 1px; background: #1d2a3b; }
+                                    StatusPill { label: root.bot_status; good: root.bot_status == "LIVE READY"; warning: root.bot_status != "LIVE READY" && root.reconciliation_status == "reconciled"; }
+                                    Text { text: "EXECUTION STATUS"; color: #566b83; font-size: 9px; font-weight: 700; }
+                                    ControlRow { label: "Mode"; value: root.execution_mode; value-color: #f4bd55; }
+                                    ControlRow { label: "Risk policy"; value: root.risk_status; value-color: #46d8a5; }
+                                    ControlRow { label: "Symbol scope"; value: root.symbol_scope; value-color: #f4bd55; }
+                                    ControlRow { label: "Sizing"; value: root.sizing_mode; value-color: #65a8f5; }
+                                    ControlRow { label: "Leverage"; value: root.leverage_status; value-color: #f4bd55; }
+                                    Rectangle { height: 1px; background: #1d2a3b; }
+                                    Text { text: "RISK BOUNDARIES"; color: #566b83; font-size: 9px; font-weight: 700; }
+                                    ControlRow { label: "Max order"; value: root.max_order_notional; value-color: #d7e2ef; }
+                                    ControlRow { label: "Daily loss cap"; value: root.daily_loss_cap; value-color: #d7e2ef; }
+                                    ControlRow { label: "Max exposure"; value: root.max_exposure; value-color: #d7e2ef; }
+                                    ControlRow { label: "Reconciliation"; value: root.reconciliation_status; value-color: root.reconciliation_status == "reconciled" ? #46d8a5 : #f4bd55; }
+                                    Rectangle { vertical-stretch: 1; }
+                                    Text { text: root.reconciliation_details; color: #64748b; font-size: 9px; wrap: word-wrap; }
+                                }
                             }
                         }
-                        GroupBox {
-                            title: "Returns by span";
-                            horizontal-stretch: 1;
-                            ChartCard { path: root.pnl_chart_path; height: 190px; }
-                        }
-                    }
-                    GroupBox {
-                        title: "Overview / last run";
-                        ScrollView {
-                            width: 100%;
-                            viewport-width: 900px;
-                            viewport-height: 150px;
-                            Text { text: root.overview_stats; color: #d1d5db; font-size: 13px; }
-                        }
-                    }
-                    GroupBox {
-                        title: "Recent activity";
-                        ScrollView {
-                            width: 100%;
-                            viewport-width: 900px;
-                            viewport-height: 110px;
-                            Text { text: root.recent_events; color: #93c5fd; font-size: 12px; }
+                        HorizontalBox {
+                            height: 190px;
+                            spacing: 10px;
+                            ChartPanel { label: "RETURNS BY WINDOW"; headline: root.realized_pnl; subhead: "realized reporting return"; path: root.pnl_chart_path; range: "DAY     WEEK     MONTH     YEAR"; horizontal-stretch: 1; stroke: #65a8f5; }
+                            TablePanel { label: "LATEST RUN / ACCOUNT READOUT"; contents: root.overview_stats; horizontal-stretch: 1; }
+                            TablePanel { label: "RECENT ACTIVITY"; contents: root.recent_events; horizontal-stretch: 1; }
                         }
                     }
                 }
+                Tab {
+                    title: "Portfolio";
+                    HorizontalBox { spacing: 10px; TablePanel { label: "POSITIONS"; contents: root.positions_table; horizontal-stretch: 2; } TablePanel { label: "BALANCE HISTORY"; contents: root.balances_table; horizontal-stretch: 1; } }
+                }
+                Tab {
+                    title: "Performance";
+                    VerticalBox {
+                        spacing: 10px;
+                        HorizontalBox {
+                            height: 250px;
+                            spacing: 10px;
+                            ChartPanel { label: "EQUITY CURVE"; headline: root.equity; subhead: "stored balance marks"; path: root.equity_chart_path; range: root.equity_chart_labels; horizontal-stretch: 2; }
+                            ChartPanel { label: "PNL DISTRIBUTION"; headline: root.realized_pnl; subhead: "realized returns"; path: root.pnl_chart_path; range: "REALIZED RETURNS"; horizontal-stretch: 1; stroke: #f4bd55; }
+                        }
+                        TablePanel { label: "PNL SNAPSHOTS"; contents: root.pnl_snapshots_table; vertical-stretch: 1; }
+                    }
+                }
+                Tab {
+                    title: "Agent activity";
+                    HorizontalBox { spacing: 10px; TablePanel { label: "AGENT RUNS"; contents: root.runs_table; horizontal-stretch: 1; } TablePanel { label: "MCP TOOL EVENTS"; contents: root.tool_events_table; horizontal-stretch: 1; } TablePanel { label: "AUDIT TRAIL"; contents: root.audit_table; horizontal-stretch: 1; } }
+                }
+                Tab {
+                    title: "Controls";
+                    VerticalBox { spacing: 10px; HorizontalBox { height: 230px; spacing: 10px; TablePanel { label: "BROKER ACCOUNTS"; contents: root.accounts_table; horizontal-stretch: 1; } TablePanel { label: "RECONCILIATION HISTORY"; contents: root.reconciliations_table; horizontal-stretch: 1; } } HorizontalBox { vertical-stretch: 1; spacing: 10px; TablePanel { label: "BASELINE ACCEPTANCES"; contents: root.baseline_acceptances_table; horizontal-stretch: 1; } TablePanel { label: "ACTIVE STRATEGY CONTRACT"; contents: root.strategy_table; horizontal-stretch: 1; } } }
+                }
+                Tab {
+                    title: "Simulations";
+                    VerticalBox { spacing: 10px; TablePanel { label: "PAPER SIMULATIONS"; contents: root.simulation_table; vertical-stretch: 1; } TablePanel { label: "REALIZED PNL TRADES"; contents: root.pnl_trades_table; vertical-stretch: 1; } }
+                }
+                Tab {
+                    title: "Order firewall";
+                    VerticalBox { spacing: 10px; TablePanel { label: "ORDER PROPOSALS / VERDICTS"; contents: root.proposals_table; vertical-stretch: 1; } }
+                }
             }
-            Tab { title: "Positions"; TableTab { contents: root.positions_table; } }
-            Tab { title: "Balances"; TableTab { contents: root.balances_table; } }
-            Tab { title: "Returns"; TableTab { contents: root.pnl_snapshots_table; } }
-            Tab { title: "Trades"; TableTab { contents: root.pnl_trades_table; } }
-            Tab { title: "Accounts"; TableTab { contents: root.accounts_table; } }
-            Tab { title: "Runs"; TableTab { contents: root.runs_table; } }
-            Tab { title: "Tool events"; TableTab { contents: root.tool_events_table; } }
-            Tab { title: "Audit"; TableTab { contents: root.audit_table; } }
-            Tab { title: "Reconciliation"; TableTab { contents: root.reconciliations_table; } }
-            Tab { title: "Baselines"; TableTab { contents: root.baseline_acceptances_table; } }
-            Tab { title: "Strategy"; TableTab { contents: root.strategy_table; } }
-            Tab { title: "Simulations"; TableTab { contents: root.simulation_table; } }
-        }
 
-        Text {
-            text: "State: " + root.database_path + "   |   Direct MCP mode: Rust auditing is not a pre-trade firewall.";
-            color: #6b7280;
-            font-size: 11px;
+            Text { text: "State: " + root.database_path + "   ·   Robinhood Trading MCP   ·   Rust audit layer is monitoring, not a deterministic pre-trade firewall"; color: #4e6279; font-size: 9px; }
         }
     }
 }
-

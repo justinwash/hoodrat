@@ -308,18 +308,47 @@ The database defaults to `data/hoodrat.db`. It contains:
   fingerprints;
 - paper simulations, their timestamped market snapshots, simulated fills and
   option-expiry settlements, and final simulated positions;
-- schema version metadata.
+- appender-only order proposals and their firewall verdicts, plus operator
+  approval records;
+- schema version metadata (currently 8).
 
 No API keys or Robinhood credentials belong in `hoodrat.json` or SQLite. Keep
 authentication in Cline's supported credential flow and the OS credential
 store where applicable.
 
+## Order firewall
+
+A deterministic pre-trade gate runs entirely in Rust between a *proposed* order
+and any broker submission. It validates the proposal against the loaded config
+(live mode, kill switch, risk confirmation, connection ready, agentic-account
+only), the strategy contract (allowed asset classes, options, symbol scope,
+max order notional, daily loss, max exposure, leverage, duplicate cooldown),
+and persisted state (latest realized PnL, equity, buying power, cash).
+
+```text
+cargo run -- gate            # show firewall state + recent proposals
+cargo run -- propose --symbol SPY --side buy --notional 25 --yes
+```
+
+The safe default posture is `gateway.submit=false`: a fully-approved proposal is
+recorded with an `approved` verdict but is **never submitted**. Set
+`gateway.submit=true` in `hoodrat.json` only when you want the scheduler/CLI
+execution path to honor an approved proposal end-to-end, and keep
+`gateway.require_operator_approval=true` for a manual go-ahead.
+
+The live equity/options lane is prompted to return a machine-readable decision
+block (not to submit directly); the scheduler feeds any such block through the
+firewall and records the verdict in `order_proposals`.
+
 ## Important limitations of this scaffold
 
 - It does not implement a Robinhood client or bypass the Trading MCP.
-- It does not infer or intercept every order tool call inside Cline output.
-- Rust risk checks are readiness and monitoring checks only under the direct
-  MCP design; they are not a deterministic pre-trade firewall.
+- It does not infer or intercept every order tool call inside Cline output, and
+  the direct Cline-to-MCP design means Rust cannot deterministically block a
+  write Cline submits before it reaches the broker. The order firewall that
+  *does* run in Rust gates proposals that flow through Hoodrat; it cannot see an
+  order that is placed by Cline outside Hoodrat's path. Robinhood's agent
+  confirmations remain the ultimate execution boundary.
 - The typed reconciliation covers the documented account, portfolio,
   realized-PnL, and realized-PnL trade-history reads. It does not infer a full
   order ledger from those reads; order/execution records remain a separate
