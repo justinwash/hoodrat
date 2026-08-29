@@ -904,9 +904,9 @@ impl Store {
             .map(|event| {
                 format!(
                     "[{}] {}: {}",
-                    event.recorded_at,
-                    event.event_type,
-                    event.text.as_deref().unwrap_or("(no text)")
+                    fit_field(&event.recorded_at, 22),
+                    fit_field(&event.event_type, 16),
+                    fit_field(event.text.as_deref().unwrap_or("(no text)"), 72)
                 )
             })
             .collect::<Vec<_>>()
@@ -1130,10 +1130,10 @@ impl Store {
         Ok(match run {
             Some(run) => format!(
                 "lane: {}\nstatus: {}\nstarted: {}\n{}",
-                run.lane,
-                run.status,
-                run.started_at,
-                run.summary.as_deref().unwrap_or("(no summary)")
+                fit_field(&run.lane, 20),
+                fit_field(&run.status, 20),
+                fit_field(&run.started_at, 20),
+                fit_field(run.summary.as_deref().unwrap_or("(no summary)"), 88)
             ),
             None => "No runs recorded.".to_owned(),
         })
@@ -1157,13 +1157,13 @@ impl Store {
         for r in rows {
             let (acct, ty, agentic, opt, state, nick) = r?;
             s.push_str(&format!(
-                "{:<15} {:<12} {:<8} {:<8} {:<10} {}\n",
-                acct,
-                ty.as_deref().unwrap_or("—"),
+                "{:<15} {:<12} {:<8} {:<9} {:<10} {}\n",
+                fit_field(&acct, 15),
+                fit_field(ty.as_deref().unwrap_or("—"), 12),
                 agentic.map(|b| if b { "YES" } else { "no" }).unwrap_or("—"),
-                opt.as_deref().unwrap_or("—"),
-                state.as_deref().unwrap_or("—"),
-                nick.as_deref().unwrap_or("")
+                fit_field(opt.as_deref().unwrap_or("—"), 9),
+                fit_field(state.as_deref().unwrap_or("—"), 10),
+                fit_field(nick.as_deref().unwrap_or(""), 16)
             ));
         }
         Ok(s)
@@ -1205,8 +1205,8 @@ impl Store {
             count += 1;
             s.push_str(&format!(
                 "{:<8} {:<7} {:<8} {:<10} {:<10} {:<10} {:<10}\n",
-                sym.as_deref().unwrap_or("—"),
-                class.as_deref().unwrap_or("—"),
+                fit_field(sym.as_deref().unwrap_or("—"), 8),
+                fit_field(class.as_deref().unwrap_or("—"), 7),
                 fmt_opt(qty),
                 fmt_money(cost),
                 fmt_money(mv),
@@ -1242,9 +1242,9 @@ impl Store {
             let (span, from, to, rp, tr, n) = r?;
             s.push_str(&format!(
                 "{:<6} {:<15} {:<15} {:<10} {:<10} {:<6}\n",
-                span,
-                from.as_deref().unwrap_or("—"),
-                to.as_deref().unwrap_or("—"),
+                fit_field(&span, 6),
+                fit_field(from.as_deref().unwrap_or("—"), 15),
+                fit_field(to.as_deref().unwrap_or("—"), 15),
                 fmt_money(rp),
                 fmt_money(tr),
                 n.map(|v: f64| format!("{v:.0}"))
@@ -1276,9 +1276,9 @@ impl Store {
             s.push_str(&format!(
                 "{:<19} {:<7} {:<6} {:<6} {:<6} {:<10}\n",
                 short_ts(&at),
-                sym.as_deref().unwrap_or("—"),
-                class.as_deref().unwrap_or("—"),
-                side.as_deref().unwrap_or("—"),
+                fit_field(sym.as_deref().unwrap_or("—"), 7),
+                fit_field(class.as_deref().unwrap_or("—"), 6),
+                fit_field(side.as_deref().unwrap_or("—"), 6),
                 fmt_opt(qty),
                 fmt_money(rp)
             ));
@@ -1304,7 +1304,12 @@ impl Store {
         let mut s = String::from("RUN ID                          LANE             STATUS\n");
         for r in rows {
             let (id, lane, _at, status) = r?;
-            s.push_str(&format!("{:<32} {:<16} {}\n", short_id(&id), lane, status));
+            s.push_str(&format!(
+                "{:<30} {:<16} {}\n",
+                short_id(&id),
+                fit_field(&lane, 16),
+                fit_field(&status, 20)
+            ));
         }
         Ok(s)
     }
@@ -1324,9 +1329,9 @@ impl Store {
         for r in rows {
             let (id, tool, err) = r?;
             s.push_str(&format!(
-                "{:<32} {:<24} {}\n",
-                short_id(&id),
-                tool,
+                "{:<30} {:<22} {}\n",
+                fit_field(&id, 30),
+                fit_field(&tool, 22),
                 if err { "✗" } else { "·" }
             ));
         }
@@ -1348,11 +1353,16 @@ impl Store {
         let mut s = String::from("TIME                CATEGORY        ACTION\n");
         for r in rows {
             let (at, cat, action, detail) = r?;
-            s.push_str(&format!("{:<19} {:<15} {}\n", short_ts(&at), cat, action));
+            s.push_str(&format!(
+                "{:<19} {:<15} {}\n",
+                short_ts(&at),
+                fit_field(&cat, 15),
+                fit_field(&action, 28)
+            ));
             if let Some(d) = detail {
                 let trimmed = d.trim();
                 if !trimmed.is_empty() && trimmed != "null" {
-                    s.push_str(&format!("    {}\n", compact_detail(trimmed)));
+                    s.push_str(&format!("    {}\n", fit_field(trimmed, 60)));
                 }
             }
         }
@@ -1407,9 +1417,9 @@ impl Store {
             s.push_str(&format!(
                 "{:<19} {:<9} {:<4} {}\n",
                 short_ts(&at),
-                op,
+                fit_field(&op, 9),
                 run.map(|v| format!("{v}")).unwrap_or_else(|| "—".into()),
-                reason
+                fit_field(&reason, 40)
             ));
         }
         Ok(s)
@@ -1430,17 +1440,17 @@ impl Store {
             ))
         })?;
         let mut s = String::from(
-            "SIMULATION                       PROFILE                     STATUS    START      FINAL      REALIZED\n",
+            "SIMULATION                       PROFILE                   STATUS    START      FINAL      REALIZED\n",
         );
         let mut n = 0;
         for r in rows {
             let (id, profile, status, start, final_, realized) = r?;
             n += 1;
             s.push_str(&format!(
-                "{:<30} {:<28} {:<9} {:<10} {:<10} {:<10}\n",
+                "{:<30} {:<24} {:<9} {:<10} {:<10} {:<10}\n",
                 short_id(&id),
-                profile,
-                status,
+                fit_field(&profile, 24),
+                fit_field(&status, 9),
                 fmt_money(start),
                 fmt_money(final_),
                 fmt_money(realized)
@@ -1568,14 +1578,14 @@ impl Store {
                 "{:<4} {:<19} {:<7} {:<6} {:<9} {:<9} {}\n",
                 id,
                 short_ts(&at),
-                symbol,
-                side,
+                fit_field(&symbol, 7),
+                fit_field(&side, 6),
                 fmt_money(Some(notional)),
-                verdict,
+                fit_field(&verdict, 9),
                 if reasons.trim().is_empty() || reasons.trim() == "[]" {
-                    "—"
+                    "—".to_owned()
                 } else {
-                    &reasons
+                    fit_field(&reasons, 30)
                 }
             ));
         }
@@ -1726,23 +1736,37 @@ pub(crate) fn fmt_money(value: Option<f64>) -> String {
         .unwrap_or_else(|| "—".to_owned())
 }
 
+/// Collapse whitespace and truncate a free-text field to a bounded length so
+/// monospace table rows never overflow their panel width on any reasonable
+/// window size. `n` includes the trailing ellipsis.
+pub(crate) fn fit_field(value: &str, n: usize) -> String {
+    let collapsed = value
+        .chars()
+        .filter(|c| *c != '\r')
+        .flat_map(|c| {
+            if c == '\n' || c == '\t' {
+                vec![' ']
+            } else {
+                vec![c]
+            }
+        })
+        .collect::<String>();
+    let trimmed = collapsed.trim();
+    if trimmed.chars().count() <= n {
+        trimmed.to_owned()
+    } else {
+        let head = trimmed
+            .chars()
+            .take(n.saturating_sub(1))
+            .collect::<String>();
+        format!("{head}…")
+    }
+}
+
 fn fmt_opt(value: Option<f64>) -> String {
     value
         .map(|v| format!("{v:.4}"))
         .unwrap_or_else(|| "—".to_owned())
-}
-
-/// Collapse embedded JSON / control characters so detail lines stay on one row.
-fn compact_detail(detail: &str) -> String {
-    let collapsed = detail
-        .chars()
-        .filter(|c| !c.is_control())
-        .collect::<String>();
-    if collapsed.len() > 160 {
-        format!("{}…", &collapsed[..160])
-    } else {
-        collapsed
-    }
 }
 
 fn ensure_column(
