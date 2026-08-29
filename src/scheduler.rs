@@ -250,6 +250,32 @@ fn run_lane(config: &Config, store: &Store, lane: Lane) -> Result<()> {
         result.event_count,
         result.tool_event_count,
     );
+    // Post-run policy enforcement: if the agent ran any direct broker write
+    // tool (place/cancel/replace/preview/order/watchlist mutation), the lane
+    // bypassed the firewall. Flag the run and force-block proposals from it.
+    let violations = crate::firewall::check_lane_policy_violations(store, &result.run_id)?;
+    if !violations.is_empty() {
+        store.record_audit(
+            Some(&result.run_id),
+            "firewall",
+            "policy_violation",
+            &serde_json::json!({"write_tools": violations}),
+        )?;
+        store.finish_run(
+            &result.run_id,
+            "policy_violation",
+            "",
+            &format!(
+                "lane called broker write tools directly: {}",
+                violations.join(", ")
+            ),
+        )?;
+        println!(
+            "  firewall: POLICY VIOLATION — direct write tools: {}",
+            violations.join(", ")
+        );
+        return Ok(());
+    }
     // Feed any machine-readable trade decision from the run through the
     // pre-trade firewall. In the safe (default) posture this records an
     // approved/blocked verdict but never submits.

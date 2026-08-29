@@ -104,6 +104,23 @@ enum CommandKind {
         #[arg(long)]
         yes: bool,
     },
+    /// List proposals awaiting operator approval.
+    Pending,
+    /// Record explicit operator approval of an approved proposal.
+    Approve {
+        /// Proposal id from `gate`/`pending`.
+        #[arg(long, required = true)]
+        id: i64,
+        /// Operator identity.
+        #[arg(long, required = true)]
+        operator: String,
+        /// Human-readable reason.
+        #[arg(long, required = true)]
+        reason: String,
+        /// Required acknowledgement.
+        #[arg(long, required = true)]
+        confirm: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -142,6 +159,13 @@ fn main() -> Result<()> {
             limit_price,
             yes,
         ),
+        CommandKind::Pending => pending(&cli.config),
+        CommandKind::Approve {
+            id,
+            operator,
+            reason,
+            confirm,
+        } => approve(&cli.config, id, &operator, &reason, confirm),
     }
 }
 
@@ -687,10 +711,61 @@ fn propose(
                 "— not submitted (gateway.submit=false)"
             }
         );
+        println!("  review with `cargo run -- gate` and approve with `cargo run -- approve --id {id} --operator <you> --reason <note> --confirm`");
     } else {
         println!("  verdict: BLOCKED (proposal #{id})");
         for reason in &verdict.reasons {
             println!("    - {reason}");
+        }
+    }
+    Ok(())
+}
+
+fn pending(config_path: &Path) -> Result<()> {
+    let (_config, store) = load_runtime(config_path)?;
+    let rows = store.pending_approvals(50)?;
+    if rows.is_empty() {
+        println!("No proposals awaiting operator approval.");
+        return Ok(());
+    }
+    println!("Proposals awaiting operator approval:");
+    for row in rows {
+        println!(
+            "  #{:<4} {:<19} {:<7} {:<10} {:<9} {}",
+            row.id,
+            store::short_ts(&row.proposed_at),
+            row.symbol,
+            row.side,
+            store::fmt_money(Some(row.notional_usd)),
+            row.verdict
+        );
+    }
+    Ok(())
+}
+
+fn approve(config_path: &Path, id: i64, operator: &str, reason: &str, confirm: bool) -> Result<()> {
+    if !confirm {
+        anyhow::bail!("--confirm is required to record approval");
+    }
+    let (config, store) = load_runtime(config_path)?;
+    if !config.gateway.require_operator_approval {
+        println!("note: gateway.require_operator_approval is false; recording approval anyway");
+    }
+    store.record_order_approval(id, operator, reason)?;
+    store.record_audit(
+        None,
+        "firewall",
+        "operator_approved",
+        &serde_json::json!({"proposal_id": id, "operator": operator, "reason": reason}),
+    )?;
+    let blockers = firewall::submission_blockers(&config, &store, id)?;
+    println!("Recorded operator approval for proposal #{id} by '{operator}'.");
+    if blockers.is_empty() {
+        println!("  proposal is clear for submission (gateway.submit enabled + approved).");
+    } else {
+        println!("  proposal still blocked from submission:");
+        for blocker in blockers {
+            println!("    - {blocker}");
         }
     }
     Ok(())

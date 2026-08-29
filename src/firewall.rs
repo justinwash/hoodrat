@@ -200,15 +200,33 @@ pub fn evaluate(
     }
 
     // ── Submission decision ───────────────────────────────────────
-    // Even a fully-approved proposal is only submitted if the operator has
-    // explicitly enabled gateway.submit. Otherwise it is recorded as approved
-    // but not submitted (operator can review + approve in a later step).
+    // The verdict approves the proposal; whether it is submitted is decided
+    // separately (see can_submit), which checks the recorded proposal id and
+    // any operator-approval requirement.
     let submitted = config.gateway.submit;
     Ok(FirewallVerdict {
         approved: true,
         submitted,
         reasons: Vec::new(),
     })
+}
+
+/// Decide whether a *recorded* approved proposal may actually be submitted.
+/// This is the final gate that runs after the proposal has an id. Returns the
+/// reasons blocking submission (empty when it may proceed).
+pub fn submission_blockers(
+    config: &Config,
+    store: &Store,
+    proposal_id: i64,
+) -> Result<Vec<String>> {
+    let mut blockers = Vec::new();
+    if !config.gateway.submit {
+        blockers.push("gateway.submit is disabled".to_owned());
+    }
+    if config.gateway.require_operator_approval && !store.has_operator_approval(proposal_id)? {
+        blockers.push("operator approval is required but not recorded".to_owned());
+    }
+    Ok(blockers)
 }
 
 /// Parse an agent's machine-readable decision block into an order proposal.
@@ -266,6 +284,57 @@ pub fn proposal_from_decision(
         quote_captured_at: None,
         source: source.to_owned(),
     })
+}
+
+/// Deterministic classification of a Robinhood Trading MCP tool name. Returns
+/// true for any tool that writes broker state (places, cancels, replaces,
+/// previews, submits, modifies, deletes, watchlist/account mutations). Used by
+/// the live-lane post-run enforcement so a run that bypassed the firewall and
+/// called a write tool directly is flagged and force-blocked.
+pub fn is_broker_write_tool(tool_name: &str) -> bool {
+    let name = tool_name
+        .rsplit("__")
+        .next()
+        .unwrap_or(tool_name)
+        .to_ascii_lowercase();
+    if name.starts_with("get_") {
+        return false;
+    }
+    matches!(
+        name.as_str(),
+        "place_order"
+            | "preview_order"
+            | "cancel_order"
+            | "replace_order"
+            | "modify_order"
+            | "submit_order"
+            | "update_order"
+            | "delete_order"
+            | "create_watchlist"
+            | "add_to_watchlist"
+            | "remove_from_watchlist"
+            | "delete_watchlist"
+            | "update_watchlist"
+            | "add"
+            | "remove"
+            | "modify"
+            | "update"
+            | "create"
+            | "delete"
+            | "enable"
+            | "disable"
+    ) || name.contains("order")
+        || name.contains("watchlist")
+}
+
+/// Verify no live-lane run called a broker write tool directly. Returns the
+/// offending tool names, or an empty vec when the run was read/propose-only.
+pub fn check_lane_policy_violations(store: &Store, run_id: &str) -> Result<Vec<String>> {
+    Ok(store
+        .run_tool_names(run_id)?
+        .into_iter()
+        .filter(|name| is_broker_write_tool(name))
+        .collect())
 }
 
 /// Verify the proposal store is reachable (used by the `gate` CLI).
@@ -364,6 +433,22 @@ mod tests {
             .reasons
             .iter()
             .any(|r| r.contains("max order notional")));
+    }
+
+    #[test]
+    fn write_tool_classifier_flags_broker_writes_only() {
+        assert!(is_broker_write_tool("robinhood-trading__place_order"));
+        assert!(is_broker_write_tool("robinhood-trading__cancel_order"));
+        assert!(is_broker_write_tool("robinhood-trading__preview_order"));
+        assert!(is_broker_write_tool("robinhood-trading__add_to_watchlist"));
+        assert!(!is_broker_write_tool("robinhood-trading__get_accounts"));
+        assert!(!is_broker_write_tool(
+            "robinhood-trading__get_equity_orders"
+        ));
+        assert!(!is_broker_write_tool(
+            "robinhood-trading__get_equity_quotes"
+        ));
+        assert!(!is_broker_write_tool("read_files"));
     }
 
     #[test]

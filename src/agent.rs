@@ -395,10 +395,14 @@ Retrieve current account, portfolio, market, watchlist, and open-order informati
 before making any decision. Never rely on stale context.\n\n\
 The user is ultimately responsible for all trades. Do not claim certainty or\n\
 a guaranteed return. Do not trade any non-Agentic Robinhood account.\n\n\
-Return a concise explanation and, if action is appropriate, clearly state the\n\
-tool action you took and its result. If no trade is appropriate, say so.\n\
-Preserve a machine-readable final summary using this shape when possible:\n\
-{{\"decision\":\"hold|buy|sell|reduce|close\",\"symbol\":\"...\",\"reason\":\"...\",\"risk_notes\":\"...\"}}\n\n\
+Return a concise explanation and, if action is appropriate, produce a single\n\
+machine-readable proposal JSON on its own final line so Hoodrat's firewall can\n\
+gate it:\n\
+{{\"decision\":\"buy|sell|buy_to_open|buy_to_close|sell_to_open|sell_to_close\",\"symbol\":\"TICKER\",\"notional_usd\":<usd>,\"quantity\":<qty if known>,\"limit_price\":<limit>,\"reason\":\"...\"}}\\n\\
+IMPORTANT: Do NOT call any tool that places, cancels, replaces, previews, or submits\n\
+an order, and do not modify watchlists or account settings. Return the proposal\n\
+only; the Hoodrat execution firewall decides whether it is submitted. If no trade\n\
+is appropriate, return {{\"decision\":\"hold\",\"reason\":\"...\"}}.\\n\\
 Current persisted context:\n{}\n\n\
  |Configured monitoring policy (not a pre-trade firewall in direct MCP mode):\n{}\n\n\
  |Strategy contract (version {}):\n{}\n\

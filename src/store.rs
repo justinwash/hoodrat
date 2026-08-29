@@ -762,6 +762,18 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// Return the distinct MCP tool names invoked by a run (from the recorded
+    /// agent_tool_events table). Used by the live-lane policy enforcement to
+    /// detect any direct write/order tool calls that bypass the firewall.
+    pub fn run_tool_names(&self, run_id: &str) -> Result<Vec<String>> {
+        let mut stmt = self
+            .connection
+            .prepare("SELECT DISTINCT tool_name FROM agent_tool_events WHERE run_id = ?1")?;
+        let rows = stmt.query_map(params![run_id], |row| row.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
     #[allow(dead_code)]
     pub fn portfolio_snapshot_count(&self) -> Result<u32> {
         self.connection
@@ -1575,6 +1587,56 @@ impl Store {
             .query_row("SELECT COUNT(*) FROM order_proposals", [], |row| {
                 row.get::<_, i64>(0)
             })
+    }
+
+    /// Record an explicit operator approval of an approved order proposal.
+    pub fn record_order_approval(
+        &self,
+        proposal_id: i64,
+        operator: &str,
+        reason: &str,
+    ) -> Result<i64> {
+        self.connection.execute(
+            "INSERT INTO order_approvals (approved_at, operator, reason, proposal_id) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                now(),
+                operator,
+                reason,
+                proposal_id,
+            ],
+        )?;
+        Ok(self.connection.last_insert_rowid())
+    }
+
+    /// Whether an approved proposal already has an operator approval record.
+    pub fn has_operator_approval(&self, proposal_id: i64) -> Result<bool> {
+        self.connection
+            .query_row(
+                "SELECT COUNT(*) FROM order_approvals WHERE proposal_id = ?1",
+                params![proposal_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|count| count > 0)
+            .map_err(Into::into)
+    }
+
+    /// Pending (approved-but-not-operator-approved) proposals.
+    pub fn pending_approvals(&self, limit: u32) -> Result<Vec<ProposalRow>> {
+        let mut stmt = self.connection.prepare(
+            "SELECT id, proposed_at, symbol, side, notional_usd, verdict FROM order_proposals WHERE verdict = 'approved' AND id NOT IN (SELECT proposal_id FROM order_approvals) ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit], |row| {
+            Ok(ProposalRow {
+                id: row.get(0)?,
+                proposed_at: row.get(1)?,
+                symbol: row.get(2)?,
+                side: row.get(3)?,
+                notional_usd: row.get(4)?,
+                verdict: row.get(5)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
 }
 

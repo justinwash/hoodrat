@@ -328,17 +328,25 @@ and persisted state (latest realized PnL, equity, buying power, cash).
 ```text
 cargo run -- gate            # show firewall state + recent proposals
 cargo run -- propose --symbol SPY --side buy --notional 25 --yes
+cargo run -- pending         # list approved proposals awaiting operator approval
+cargo run -- approve --id 3 --operator you --reason "reviewed" --confirm
 ```
 
 The safe default posture is `gateway.submit=false`: a fully-approved proposal is
 recorded with an `approved` verdict but is **never submitted**. Set
 `gateway.submit=true` in `hoodrat.json` only when you want the scheduler/CLI
 execution path to honor an approved proposal end-to-end, and keep
-`gateway.require_operator_approval=true` for a manual go-ahead.
+`gateway.require_operator_approval=true` for a manual go-ahead (the `approve`
+command records the operator approval that `gateway.submit=true` then requires).
 
 The live equity/options lane is prompted to return a machine-readable decision
 block (not to submit directly); the scheduler feeds any such block through the
-firewall and records the verdict in `order_proposals`.
+firewall and records the verdict in `order_proposals`. The live lane is also
+enforced post-run: if a run calls any broker write tool directly
+(place/cancel/replace/preview/order/watchlist mutation) instead of returning a
+proposal, Hoodrat marks the run `policy_violation`, records it in the audit log,
+and force-blocks any proposal from that run — a direct Cline-to-MCP order cannot
+be silently approved afterwards.
 
 ## Important limitations of this scaffold
 
