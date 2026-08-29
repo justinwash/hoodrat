@@ -360,29 +360,41 @@ export component MainWindow inherits Window {
                             spacing: 10px;
                             ChartPanel { label: "PORTFOLIO EQUITY"; headline: root.equity; subhead: "account net liquidation"; path: root.equity_chart_path; range: root.equity_chart_labels; horizontal-stretch: 2; }
                             Rectangle {
-                                width: 330px;
+                                width: 348px;
                                 background: #101927;
                                 border-radius: 7px;
                                 border-width: 1px;
                                 border-color: #1d2a3b;
-                                VerticalBox {
+                                control-panel := VerticalBox {
                                     PanelTitle { label: "CONTROL CENTER"; }
                                     Rectangle { height: 1px; background: #1d2a3b; }
                                     StatusPill { label: root.bot_status; good: root.bot_status == "LIVE READY"; warning: root.bot_status != "LIVE READY" && root.reconciliation_status == "reconciled"; }
-                                    Text { text: "EXECUTION STATUS"; color: #566b83; font-size: 9px; font-weight: 700; }
+                                    Text { text: "EXECUTION STATUS"; color: #718096; font-size: 10px; font-weight: 700; }
                                     ControlRow { label: "Mode"; value: root.execution_mode; value-color: #f4bd55; }
                                     ControlRow { label: "Risk policy"; value: root.risk_status; value-color: #46d8a5; }
                                     ControlRow { label: "Symbol scope"; value: root.symbol_scope; value-color: #f4bd55; }
                                     ControlRow { label: "Sizing"; value: root.sizing_mode; value-color: #65a8f5; }
                                     ControlRow { label: "Leverage"; value: root.leverage_status; value-color: #f4bd55; }
                                     Rectangle { height: 1px; background: #1d2a3b; }
-                                    Text { text: "RISK BOUNDARIES"; color: #566b83; font-size: 9px; font-weight: 700; }
+                                    Text { text: "RISK BOUNDARIES"; color: #718096; font-size: 10px; font-weight: 700; }
                                     ControlRow { label: "Max order"; value: root.max_order_notional; value-color: #d7e2ef; }
                                     ControlRow { label: "Daily loss cap"; value: root.daily_loss_cap; value-color: #d7e2ef; }
                                     ControlRow { label: "Max exposure"; value: root.max_exposure; value-color: #d7e2ef; }
                                     ControlRow { label: "Reconciliation"; value: root.reconciliation_status; value-color: root.reconciliation_status == "reconciled" ? #46d8a5 : #f4bd55; }
-                                    Rectangle { vertical-stretch: 1; }
-                                    Text { text: root.reconciliation_details; color: #64748b; font-size: 9px; wrap: word-wrap; }
+                                    Rectangle { height: 1px; background: #1d2a3b; }
+                                    ScrollView {
+                                        vertical-stretch: 1;
+                                        width: 100%;
+                                        viewport-width: control-panel.width - 22px;
+                                        viewport-height: 200px;
+                                        Text {
+                                            text: root.reconciliation_details;
+                                            color: #94a3b8;
+                                            font-family: "monospace";
+                                            font-size: 10px;
+                                            wrap: word-wrap;
+                                        }
+                                    }
                                 }
                             }
                         }

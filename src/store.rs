@@ -1925,19 +1925,26 @@ fn reconciliation_details(report: &ReconciliationReport) -> String {
         report.order_history_status
     );
     if !report.drift.is_empty() {
-        details.push_str("; drift=");
+        details.push_str(" · drift=");
         details.push_str(&report.drift.join(","));
     }
     if !report.coverage.is_empty() {
-        details.push_str("; coverage=");
-        details.push_str(
-            &report
-                .coverage
-                .iter()
-                .map(|(name, state)| format!("{name}:{state}"))
-                .collect::<Vec<_>>()
-                .join(","),
-        );
+        let pairs = report
+            .coverage
+            .iter()
+            .map(|(name, state)| format!("{name}:{state}"))
+            .collect::<Vec<_>>();
+        // Join every two pairs onto a line so the footer stays scannable
+        // instead of one ultra-long comma run.
+        details.push_str(" · coverage=");
+        for (i, pair) in pairs.iter().enumerate() {
+            if i > 0 && i % 2 == 0 {
+                details.push('\n');
+            } else if i > 0 {
+                details.push_str(", ");
+            }
+            details.push_str(pair);
+        }
     }
     details
 }
